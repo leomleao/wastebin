@@ -8,27 +8,37 @@ use crate::handlers::NoStore;
 use crate::handlers::extract::{Password, Theme};
 use crate::handlers::html::{ErrorResponse, FormAction, PasswordInput, make_error};
 use crate::i18n::Lang;
-use crate::media::detect_mime;
+use crate::media::asset_mime;
 use crate::{Database, Page};
 use wastebin_core::db;
 use wastebin_core::db::read::{Data, Entry};
 
+/// Content policy for uploaded images: nothing in them may run.
+const CSP_IMAGE: HeaderValue = HeaderValue::from_static(
+    "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox",
+);
+
+/// Content policy for uploaded PDFs. Browsers refuse to run their PDF viewer in a sandboxed
+/// document, and the pad editor embeds PDFs in a same-origin frame.
+const CSP_PDF: HeaderValue = HeaderValue::from_static("default-src 'none'; frame-ancestors 'self'");
+
 fn raw_response(key: &Key, data: Data) -> Response {
+    if !data.metadata.is_asset {
+        return data.text.into_response();
+    }
+
     let ext = key.ext.as_deref().or(data.metadata.extension.as_deref());
-    let mime = detect_mime(&data.bytes, ext);
+    let mime = asset_mime(&data.bytes, ext);
+    let csp = if mime == "application/pdf" {
+        CSP_PDF
+    } else {
+        CSP_IMAGE
+    };
+
     (
         [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_str(mime)
-                    .unwrap_or(HeaderValue::from_static("application/octet-stream")),
-            ),
-            (
-                header::CONTENT_SECURITY_POLICY,
-                HeaderValue::from_static(
-                    "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox",
-                ),
-            ),
+            (header::CONTENT_TYPE, HeaderValue::from_static(mime)),
+            (header::CONTENT_SECURITY_POLICY, csp),
         ],
         data.bytes,
     )
@@ -120,8 +130,8 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         assert!(res.headers().get(header::CACHE_CONTROL).is_none());
         assert_eq!(
-            res.headers().get(header::CONTENT_SECURITY_POLICY).unwrap(),
-            "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox"
+            res.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
         );
 
         Ok(())
@@ -131,45 +141,63 @@ mod tests {
     async fn raw_image_and_pdf() -> Result<(), Box<dyn std::error::Error>> {
         let client = Client::new(StoreCookies(false)).await;
 
-        let img_entry = Entry {
-            text: String::from("data:image/png;base64,iVBORw0KGgo="),
-            title: String::from("photo.png"),
-            ..Default::default()
-        };
-        let res = client.post_form().form(&img_entry).send().await?;
-        assert_eq!(res.status(), StatusCode::SEE_OTHER);
-        let loc = res.headers().get("location").unwrap().to_str()?.to_owned();
-
-        let res = client.get(&format!("/raw{loc}")).send().await?;
+        let url = client
+            .upload_asset("data:image/png;base64,iVBORw0KGgo=", "photo.png")
+            .await?;
+        let res = client.get(&url).send().await?;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
-            res.headers().get(header::CONTENT_TYPE).unwrap().to_str()?,
+            res.headers().get(header::CONTENT_TYPE).unwrap(),
             "image/png"
         );
         assert_eq!(
             res.headers().get(header::CONTENT_SECURITY_POLICY).unwrap(),
             "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox"
         );
-        let body = res.bytes().await?;
-        assert!(!body.is_empty());
+        assert!(!res.bytes().await?.is_empty());
 
-        let pdf_entry = Entry {
-            text: String::from("data:application/pdf;base64,JVBERi0xLjQ="),
-            title: String::from("doc.pdf"),
-            ..Default::default()
-        };
-        let res = client.post_form().form(&pdf_entry).send().await?;
-        assert_eq!(res.status(), StatusCode::SEE_OTHER);
-        let loc = res.headers().get("location").unwrap().to_str()?.to_owned();
-
-        let res = client.get(&format!("/raw{loc}")).send().await?;
+        let url = client
+            .upload_asset("data:application/pdf;base64,JVBERi0xLjQ=", "doc.pdf")
+            .await?;
+        let res = client.get(&url).send().await?;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
-            res.headers().get(header::CONTENT_TYPE).unwrap().to_str()?,
+            res.headers().get(header::CONTENT_TYPE).unwrap(),
             "application/pdf"
         );
-        let body = res.bytes().await?;
-        assert!(body.starts_with(b"%PDF-"));
+        // No sandbox, so that the browser's PDF viewer runs inside the editor's frame.
+        assert_eq!(
+            res.headers().get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            "default-src 'none'; frame-ancestors 'self'"
+        );
+        assert!(res.bytes().await?.starts_with(b"%PDF-"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_text_is_never_sniffed() -> Result<(), Box<dyn std::error::Error>> {
+        let client = Client::new(StoreCookies(false)).await;
+
+        for text in [
+            "BM looks like a bitmap",
+            "<svg onload=alert(1)>",
+            "data:image/png;base64,iVBORw0KGgo=",
+        ] {
+            let data = Entry {
+                text: String::from(text),
+                ..Default::default()
+            };
+            let res = client.post_form().form(&data).send().await?;
+            let location = res.headers().get("location").unwrap().to_str()?.to_owned();
+
+            let res = client.get(&format!("/raw{location}")).send().await?;
+            assert_eq!(
+                res.headers().get(header::CONTENT_TYPE).unwrap(),
+                "text/plain; charset=utf-8"
+            );
+            assert_eq!(res.text().await?, text);
+        }
 
         Ok(())
     }

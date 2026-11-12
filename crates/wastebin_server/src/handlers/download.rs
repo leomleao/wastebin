@@ -11,7 +11,7 @@ use crate::handlers::NoStore;
 use crate::handlers::extract::{Password, Theme};
 use crate::handlers::html::{ErrorResponse, FormAction, PasswordInput, make_error};
 use crate::i18n::Lang;
-use crate::media::detect_mime;
+use crate::media::asset_mime;
 use wastebin_core::db::read::{Data, Entry};
 use wastebin_core::db::{self, Database};
 
@@ -62,31 +62,43 @@ fn make_content_disposition(filename: &str) -> HeaderValue {
     HeaderValue::try_from(value).unwrap_or_else(|_| HeaderValue::from_static("attachment"))
 }
 
-fn get_download(key: &Key, data: Data) -> impl IntoResponse {
-    let ext = key.ext.as_deref().or(data.metadata.extension.as_deref());
-    let mime = detect_mime(&data.bytes, ext);
+fn get_download(key: &Key, data: Data) -> Response {
     let mut filename = data.metadata.title.unwrap_or_else(|| key.to_string());
 
-    if !filename.contains('.') {
-        if let Some(ext) = ext {
-            filename.push('.');
-            filename.push_str(ext);
-        }
+    if !data.metadata.is_asset {
+        let content_type = "text; charset=utf-8";
+        let content_disposition = make_content_disposition(&filename);
+
+        return (
+            [
+                (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+                (header::CONTENT_DISPOSITION, content_disposition),
+            ],
+            data.text,
+        )
+            .into_response();
+    }
+
+    let ext = key.ext.as_deref().or(data.metadata.extension.as_deref());
+    let mime = asset_mime(&data.bytes, ext);
+
+    if !filename.contains('.')
+        && let Some(ext) = ext
+    {
+        filename.push('.');
+        filename.push_str(ext);
     }
 
     let content_disposition = make_content_disposition(&filename);
 
     (
         [
-            (
-                header::CONTENT_TYPE,
-                HeaderValue::from_str(mime)
-                    .unwrap_or(HeaderValue::from_static("application/octet-stream")),
-            ),
+            (header::CONTENT_TYPE, HeaderValue::from_static(mime)),
             (header::CONTENT_DISPOSITION, content_disposition),
         ],
         data.bytes,
     )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -208,18 +220,10 @@ mod tests {
     async fn download_image_and_pdf() -> Result<(), Box<dyn std::error::Error>> {
         let client = Client::new(StoreCookies(false)).await;
 
-        // Image upload
-        let img_entry = Entry {
-            text: String::from("data:image/png;base64,iVBORw0KGgo="),
-            title: String::from("photo"),
-            ..Default::default()
-        };
-        let res = client.post_form().form(&img_entry).send().await?;
-        assert_eq!(res.status(), StatusCode::SEE_OTHER);
-        let loc = res.headers().get("location").unwrap().to_str()?.to_owned();
-        assert!(loc.ends_with(".png"));
-
-        let res = client.get(&format!("/dl{loc}")).send().await?;
+        let url = client
+            .upload_asset("data:image/png;base64,iVBORw0KGgo=", "photo")
+            .await?;
+        let res = client.get(&url.replacen("/raw/", "/dl/", 1)).send().await?;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
             res.headers().get(header::CONTENT_TYPE).unwrap().to_str()?,
@@ -228,18 +232,10 @@ mod tests {
         let content_disposition = res.headers().get(header::CONTENT_DISPOSITION).unwrap();
         assert!(content_disposition.to_str()?.contains("photo.png"));
 
-        // PDF upload
-        let pdf_entry = Entry {
-            text: String::from("data:application/pdf;base64,JVBERi0xLjQ="),
-            title: String::from("paper.pdf"),
-            ..Default::default()
-        };
-        let res = client.post_form().form(&pdf_entry).send().await?;
-        assert_eq!(res.status(), StatusCode::SEE_OTHER);
-        let loc = res.headers().get("location").unwrap().to_str()?.to_owned();
-        assert!(loc.ends_with(".pdf"));
-
-        let res = client.get(&format!("/dl{loc}")).send().await?;
+        let url = client
+            .upload_asset("data:application/pdf;base64,JVBERi0xLjQ=", "paper.pdf")
+            .await?;
+        let res = client.get(&url.replacen("/raw/", "/dl/", 1)).send().await?;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(
             res.headers().get(header::CONTENT_TYPE).unwrap().to_str()?,

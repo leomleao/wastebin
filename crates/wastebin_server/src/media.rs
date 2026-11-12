@@ -1,45 +1,34 @@
-/// Helper functions for recognizing and formatting media (images, PDFs, text).
+//! Helpers for recognizing and formatting uploaded media (images and PDFs).
 
 pub fn is_image_ext(ext: Option<&str>) -> bool {
     matches!(
         ext.map(|s| s.to_ascii_lowercase()).as_deref(),
-        Some(
-            "png"
-                | "jpg"
-                | "jpeg"
-                | "gif"
-                | "webp"
-                | "avif"
-                | "bmp"
-                | "ico"
-                | "tiff"
-                | "tif"
-        )
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "ico" | "tiff" | "tif")
     )
 }
 
 pub fn is_pdf_ext(ext: Option<&str>) -> bool {
-    matches!(
-        ext.map(|s| s.to_ascii_lowercase()).as_deref(),
-        Some("pdf")
-    )
+    matches!(ext.map(|s| s.to_ascii_lowercase()).as_deref(), Some("pdf"))
 }
 
-pub fn detect_mime(bytes: &[u8], ext: Option<&str>) -> &'static str {
+/// MIME type of an asset uploaded from the pad editor, from its extension or, lacking one, from
+/// the magic bytes of the binary formats the editor accepts. Must only be used for entries
+/// stored as assets: text pastes are always served as plain text.
+pub fn asset_mime(bytes: &[u8], ext: Option<&str>) -> &'static str {
     if let Some(ext) = ext {
-        match ext.to_ascii_lowercase().as_str() {
-            "png" => return "image/png",
-            "jpg" | "jpeg" => return "image/jpeg",
-            "gif" => return "image/gif",
-            "webp" => return "image/webp",
-            "svg" => return "image/svg+xml",
-            "avif" => return "image/avif",
-            "bmp" => return "image/bmp",
-            "ico" => return "image/x-icon",
-            "tiff" | "tif" => return "image/tiff",
-            "pdf" => return "application/pdf",
-            _ => return "text/plain; charset=utf-8",
-        }
+        return match ext.to_ascii_lowercase().as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "svg" => "image/svg+xml",
+            "avif" => "image/avif",
+            "bmp" => "image/bmp",
+            "ico" => "image/x-icon",
+            "tiff" | "tif" => "image/tiff",
+            "pdf" => "application/pdf",
+            _ => "application/octet-stream",
+        };
     }
 
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -52,21 +41,9 @@ pub fn detect_mime(bytes: &[u8], ext: Option<&str>) -> &'static str {
         "image/webp"
     } else if bytes.starts_with(b"%PDF-") {
         "application/pdf"
-    } else if bytes.starts_with(b"BM") {
-        "image/bmp"
-    } else if bytes.starts_with(b"<svg") {
-        "image/svg+xml"
     } else {
-        "text/plain; charset=utf-8"
+        "application/octet-stream"
     }
-}
-
-pub fn is_image(bytes: &[u8], ext: Option<&str>) -> bool {
-    is_image_ext(ext) || detect_mime(bytes, None).starts_with("image/")
-}
-
-pub fn is_pdf(bytes: &[u8], ext: Option<&str>) -> bool {
-    is_pdf_ext(ext) || detect_mime(bytes, None) == "application/pdf"
 }
 
 pub fn format_size(bytes: usize) -> String {
@@ -105,39 +82,35 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_mime_non_executable() {
-        // Executable or rich text formats must never return executable MIME types
-        assert_eq!(detect_mime(b"alert(1)", Some("html")), "text/plain; charset=utf-8");
-        assert_eq!(detect_mime(b"alert(1)", Some("js")), "text/plain; charset=utf-8");
-        assert_eq!(detect_mime(b"<xml></xml>", Some("xml")), "text/plain; charset=utf-8");
-        assert_eq!(detect_mime(b"body {}", Some("css")), "text/plain; charset=utf-8");
-        assert_eq!(detect_mime(b"{}", Some("json")), "text/plain; charset=utf-8");
-        assert_eq!(detect_mime(b"fn main() {}", Some("rs")), "text/plain; charset=utf-8");
-        assert_eq!(detect_mime(b"print(1)", Some("py")), "text/plain; charset=utf-8");
-
-        // Media extensions return proper media MIME
-        assert_eq!(detect_mime(b"", Some("png")), "image/png");
-        assert_eq!(detect_mime(b"", Some("jpg")), "image/jpeg");
-        assert_eq!(detect_mime(b"", Some("jpeg")), "image/jpeg");
-        assert_eq!(detect_mime(b"", Some("gif")), "image/gif");
-        assert_eq!(detect_mime(b"", Some("webp")), "image/webp");
-        assert_eq!(detect_mime(b"", Some("svg")), "image/svg+xml");
-        assert_eq!(detect_mime(b"", Some("avif")), "image/avif");
-        assert_eq!(detect_mime(b"", Some("bmp")), "image/bmp");
-        assert_eq!(detect_mime(b"", Some("ico")), "image/x-icon");
-        assert_eq!(detect_mime(b"", Some("tiff")), "image/tiff");
-        assert_eq!(detect_mime(b"", Some("tif")), "image/tiff");
-        assert_eq!(detect_mime(b"", Some("pdf")), "application/pdf");
+    fn asset_mime_from_extension() {
+        assert_eq!(asset_mime(b"", Some("png")), "image/png");
+        assert_eq!(asset_mime(b"", Some("JPG")), "image/jpeg");
+        assert_eq!(asset_mime(b"", Some("svg")), "image/svg+xml");
+        assert_eq!(asset_mime(b"", Some("tif")), "image/tiff");
+        assert_eq!(asset_mime(b"", Some("pdf")), "application/pdf");
+        // Executable or rich text formats never get an executable MIME type.
+        assert_eq!(
+            asset_mime(b"<html>", Some("html")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            asset_mime(b"alert(1)", Some("js")),
+            "application/octet-stream"
+        );
     }
 
     #[test]
-    fn test_detect_mime_svg_sniffing() {
-        // Content merely mentioning <svg later in the body must NOT be classified as svg
-        let html_content = b"<!DOCTYPE html><html><body><div class=\"icon\"><svg viewBox=\"0 0 10 10\"></svg></div></body></html>";
-        assert_eq!(detect_mime(html_content, None), "text/plain; charset=utf-8");
-
-        // Starts with <svg without ext is classified as image/svg+xml
-        let svg_content = b"<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>";
-        assert_eq!(detect_mime(svg_content, None), "image/svg+xml");
+    fn asset_mime_from_magic_bytes() {
+        assert_eq!(asset_mime(b"\x89PNG\r\n\x1a\nrest", None), "image/png");
+        assert_eq!(asset_mime(b"%PDF-1.4", None), "application/pdf");
+        // Text that merely starts like a bitmap or an SVG is not trusted.
+        assert_eq!(
+            asset_mime(b"BMW is a car", None),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            asset_mime(b"<svg onload=alert(1)>", None),
+            "application/octet-stream"
+        );
     }
 }

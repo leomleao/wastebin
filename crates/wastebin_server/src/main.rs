@@ -93,11 +93,13 @@ impl FromRef<AppState> for Cache {
 
 async fn security_headers_layer(req: Request, next: Next) -> impl IntoResponse {
     // Rendered Markdown may embed remote images via `![](…)`; relax img-src for that route only.
+    // The pad editor talks to the pad API and its event stream (`connect-src`) and embeds
+    // uploaded PDFs from `/raw/` (`frame-src`).
     const CSP_STRICT: HeaderValue = HeaderValue::from_static(
-        "default-src 'none'; connect-src 'self'; script-src 'self'; img-src 'self' data: blob: * ; style-src 'self' 'unsafe-inline' data: ; font-src 'self' data: ; object-src 'self' ; frame-src 'self' data: blob: ; base-uri 'none' ; frame-ancestors 'self' ; form-action 'self' ;",
+        "default-src 'none'; script-src 'self'; connect-src 'self'; img-src 'self' data: ; style-src 'self' data: ; font-src 'self' data: ; object-src 'none' ; frame-src 'self' ; base-uri 'none' ; frame-ancestors 'none' ; form-action 'self' ;",
     );
     const CSP_RENDERED: HeaderValue = HeaderValue::from_static(
-        "default-src 'none'; script-src 'self'; img-src * data: ; style-src 'self' data: ; font-src 'self' data: ; object-src 'self' ; frame-src 'self' data: ; base-uri 'none' ; frame-ancestors 'self' ; form-action 'self' ;",
+        "default-src 'none'; script-src 'self'; img-src * data: ; style-src 'self' data: ; font-src 'self' data: ; object-src 'none' ; base-uri 'none' ; frame-ancestors 'none' ; form-action 'self' ;",
     );
 
     let csp = if req.uri().path().starts_with("/md/") {
@@ -108,6 +110,8 @@ async fn security_headers_layer(req: Request, next: Next) -> impl IntoResponse {
 
     let mut res = next.run(req).await.into_response();
     let res_headers = res.headers_mut();
+
+    // Handlers may set their own policy, e.g. `/raw/` for uploaded images and PDFs.
 
     for (name, value) in [
         (SERVER, HeaderValue::from_static(env!("CARGO_PKG_NAME"))),
@@ -223,6 +227,7 @@ fn make_app(state: AppState, timeout: Duration, max_body_size: usize) -> Router 
         .route("/robots.txt", get(robots::get))
         .route("/theme", get(theme::get))
         .route("/new", get(html::index::get).post(insert::form::post))
+        .route("/api/pads", get(pad::list_pads))
         .route("/api/pad/latest", get(pad::get_latest))
         .route("/api/pad", post(pad::create_pad))
         .route(
@@ -231,7 +236,15 @@ fn make_app(state: AppState, timeout: Duration, max_body_size: usize) -> Router 
                 .put(pad::update_pad)
                 .delete(pad::delete_pad),
         )
-        .route("/api/asset", post(pad::upload_asset))
+        .route("/api/pad/{id}/md", get(pad::render_markdown))
+        .route(
+            "/api/asset",
+            // Assets arrive as base64 `data:` URLs, which are 4/3 the size of the file. The
+            // handler checks the decoded size against the configured maximum.
+            post(pad::upload_asset).layer(DefaultBodyLimit::max(
+                max_body_size.saturating_mul(4) / 3 + 1024,
+            )),
+        )
         .route("/qr/{id}", get(html::qr::get))
         .route(
             "/md/{id}",
@@ -249,7 +262,7 @@ fn make_app(state: AppState, timeout: Duration, max_body_size: usize) -> Router 
         .route("/delete/{id}", post(delete::form::delete))
         .layer(
             ServiceBuilder::new()
-                .layer(DefaultBodyLimit::max(max_body_size.saturating_mul(3) / 2))
+                .layer(DefaultBodyLimit::max(max_body_size))
                 .layer(
                     CompressionLayer::new()
                         .compress_when(DefaultPredicate::new().and(SizeAbove::new(256))),

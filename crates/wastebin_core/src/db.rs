@@ -1,9 +1,10 @@
 use std::io::Cursor;
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use chacha20poly1305::XNonce;
-use rusqlite::{Connection, Transaction, params, params_from_iter};
+use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 use rusqlite_migration::{HookError, M, Migrations};
 use tokio::sync::oneshot;
 
@@ -94,10 +95,14 @@ enum Command {
     Purge {
         result: oneshot::Sender<Result<Vec<Id>, Error>>,
     },
-    Update {
+    UpdatePad {
         id: Id,
-        entry: write::DatabaseEntry,
-        result: oneshot::Sender<Result<write::Entry, Error>>,
+        update: write::PadUpdate,
+        result: oneshot::Sender<Result<Metadata, Error>>,
+    },
+    DeletePad {
+        id: Id,
+        result: oneshot::Sender<Result<bool, Error>>,
     },
     GetLatestPadId {
         result: oneshot::Sender<Result<Option<Id>, Error>>,
@@ -145,9 +150,26 @@ pub mod write {
         pub password: Option<String>,
         /// Title
         pub title: Option<String>,
-        /// Whether this entry is a standalone asset (e.g. inline pasted image) rather than a pad
+        /// Whether this entry is a binary asset uploaded from the pad editor. Only assets have
+        /// their `data:` URL text decoded into raw bytes.
         #[serde(default)]
         pub is_asset: bool,
+        /// Whether this entry is a live pad, editable through the pad API.
+        #[serde(default)]
+        pub is_pad: bool,
+    }
+
+    /// New content and optional metadata changes for an existing pad.
+    #[derive(Debug)]
+    pub struct PadUpdate {
+        /// Compressed content
+        pub data: Vec<u8>,
+        /// File extension
+        pub extension: Option<String>,
+        /// `Some` replaces the title (`Some(None)` clears it), `None` keeps it.
+        pub title: Option<Option<String>>,
+        /// `Some` resets the expiration (`Some(None)` never expires), `None` keeps it.
+        pub expires: Option<Option<NonZeroU32>>,
     }
 
     /// A compressed entry to be inserted.
@@ -169,44 +191,23 @@ pub mod write {
     }
 
     impl Entry {
-        /// Compress the entry for insertion.
+        /// Compress the entry for insertion. The `data:…;base64,` text of an asset upload is
+        /// decoded and stored as raw bytes; any other text is stored as is.
         pub async fn compress(mut self) -> Result<CompressedEntry, Error> {
-            let bytes = if let Some(payload) = self.text.strip_prefix("data:") {
-                if let Some((header, b64)) = payload.split_once(";base64,") {
-                    use base64::Engine;
-                    let decoded = base64::engine::general_purpose::STANDARD
-                        .decode(b64.trim())
-                        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b64.trim()));
-
-                    if let Ok(decoded_bytes) = decoded {
-                        if self.extension.is_none() {
-                            let mime = header.trim();
-                            let ext = match mime {
-                                "image/png" => Some("png"),
-                                "image/jpeg" | "image/jpg" => Some("jpg"),
-                                "image/gif" => Some("gif"),
-                                "image/webp" => Some("webp"),
-                                "image/svg+xml" => Some("svg"),
-                                "image/avif" => Some("avif"),
-                                "image/bmp" => Some("bmp"),
-                                "image/x-icon" | "image/vnd.microsoft.icon" => Some("ico"),
-                                "image/tiff" => Some("tiff"),
-                                "application/pdf" => Some("pdf"),
-                                _ => None,
-                            };
-                            if let Some(ext) = ext {
-                                self.extension = Some(ext.to_string());
-                            }
-                        }
-                        decoded_bytes
-                    } else {
-                        self.text.as_bytes().to_vec()
-                    }
-                } else {
-                    self.text.as_bytes().to_vec()
-                }
+            let decoded = if self.is_asset {
+                decode_data_url(&self.text)
             } else {
-                self.text.as_bytes().to_vec()
+                None
+            };
+
+            let bytes = match decoded {
+                Some((ext, bytes)) => {
+                    if self.extension.is_none() {
+                        self.extension = ext.map(str::to_string);
+                    }
+                    bytes
+                }
+                None => self.text.as_bytes().to_vec(),
             };
 
             let mut encoder = ZstdEncoder::new(Cursor::new(bytes));
@@ -219,6 +220,46 @@ pub mod write {
 
             Ok(CompressedEntry { entry: self, data })
         }
+    }
+
+    /// Decode a base64 `data:` URL into the file extension of its media type and its bytes.
+    fn decode_data_url(text: &str) -> Option<(Option<&'static str>, Vec<u8>)> {
+        use base64::Engine;
+
+        let (header, b64) = text.strip_prefix("data:")?.split_once(";base64,")?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64.trim())
+            .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b64.trim()))
+            .ok()?;
+
+        let ext = match header.trim() {
+            "image/png" => Some("png"),
+            "image/jpeg" | "image/jpg" => Some("jpg"),
+            "image/gif" => Some("gif"),
+            "image/webp" => Some("webp"),
+            "image/svg+xml" => Some("svg"),
+            "image/avif" => Some("avif"),
+            "image/bmp" => Some("bmp"),
+            "image/x-icon" | "image/vnd.microsoft.icon" => Some("ico"),
+            "image/tiff" => Some("tiff"),
+            "application/pdf" => Some("pdf"),
+            _ => None,
+        };
+
+        Some((ext, bytes))
+    }
+
+    /// Compress `text` for storing it as pad content.
+    pub async fn compress_text(text: &str) -> Result<Vec<u8>, Error> {
+        let mut encoder = ZstdEncoder::new(Cursor::new(text.as_bytes()));
+        let mut data = Vec::new();
+
+        encoder
+            .read_to_end(&mut data)
+            .await
+            .map_err(|e| Error::Compression(e.to_string()))?;
+
+        Ok(data)
     }
 
     impl CompressedEntry {
@@ -312,6 +353,10 @@ pub mod read {
         pub title: Option<String>,
         /// File extension
         pub extension: Option<String>,
+        /// Entry is a binary asset uploaded from the pad editor
+        pub is_asset: bool,
+        /// Entry is a live pad
+        pub is_pad: bool,
         /// Entry expiration datetime
         pub expiration: Option<Expiration>,
         /// Entry will be deleted the next time it is fetched via [`Database::get`].
@@ -344,13 +389,17 @@ pub mod read {
         pub is_expired: bool,
     }
 
-    /// Summary of a recent pad for sidebar / recent pads listing.
-    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    /// Summary of a pad for the recent pads list.
+    #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PadSummary {
+        /// Identifier
         pub id: String,
-        pub extension: Option<String>,
+        /// Title
+        pub title: Option<String>,
+        /// First line of text, ignoring inline asset captions
+        pub preview: Option<String>,
+        /// Last modification as RFC 3339 UTC timestamp
         pub updated_at: Option<String>,
-        pub preview: String,
     }
 
     impl DatabaseEntry {
@@ -388,7 +437,9 @@ pub mod read {
                 .await
                 .map_err(|e| Error::Compression(e.to_string()))?;
 
-            let text = std::str::from_utf8(&bytes).map(str::to_owned).unwrap_or_default();
+            let text = std::str::from_utf8(&bytes)
+                .map(str::to_owned)
+                .unwrap_or_default();
 
             Ok(UncompressedEntry {
                 bytes,
@@ -458,6 +509,7 @@ impl Handler {
             M::up(include_str!(
                 "migrations/0009-add-updated-at-and-is-asset.sql"
             )),
+            M::up(include_str!("migrations/0010-add-is-pad-column.sql")),
         ]);
 
         migrations.to_latest(&mut conn)?;
@@ -516,8 +568,11 @@ impl Handler {
                 Command::Purge { result } => result
                     .send(self.purge())
                     .map_err(|_| Error::ResultSendError),
-                Command::Update { id, entry, result } => result
-                    .send(self.update(id, entry))
+                Command::UpdatePad { id, update, result } => result
+                    .send(self.update_pad(id, update))
+                    .map_err(|_| Error::ResultSendError),
+                Command::DeletePad { id, result } => result
+                    .send(self.delete_pad(id))
                     .map_err(|_| Error::ResultSendError),
                 Command::GetLatestPadId { result } => result
                     .send(self.get_latest_pad_id())
@@ -547,7 +602,7 @@ impl Handler {
 
             let result = match entry.expires {
                 None => self.conn.execute(
-                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, title, extension, is_asset, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, title, extension, is_asset, is_pad, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                     params![
                         id.to_i64(),
                         entry.uid,
@@ -557,11 +612,12 @@ impl Handler {
                         title,
                         entry.extension,
                         entry.is_asset,
+                        entry.is_pad,
                         &updated_at,
                     ],
                 ),
                 Some(expires) => self.conn.execute(
-                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, expires, title, extension, is_asset, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', ?6), ?7, ?8, ?9, ?10)",
+                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, expires, title, extension, is_asset, is_pad, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', ?6), ?7, ?8, ?9, ?10, ?11)",
                     params![
                         id.to_i64(),
                         entry.uid,
@@ -572,6 +628,7 @@ impl Handler {
                         title,
                         entry.extension,
                         entry.is_asset,
+                        entry.is_pad,
                         &updated_at,
                     ],
                 ),
@@ -603,7 +660,7 @@ impl Handler {
 
     fn get_metadata(&self, id: Id) -> Result<Metadata, Error> {
         let metadata = self.conn.query_row(
-            "SELECT uid, title, CAST(ROUND((julianday(expires) - julianday('now')) * 86400) AS INTEGER), burn_after_reading, extension FROM entries WHERE id=?1",
+            "SELECT uid, title, CAST(ROUND((julianday(expires) - julianday('now')) * 86400) AS INTEGER), burn_after_reading, extension, is_asset, is_pad FROM entries WHERE id=?1",
             params![id.to_i64()],
             |row| {
                 let expiration = row.get::<_, Option<i64>>(2)?
@@ -615,6 +672,8 @@ impl Handler {
                     uid: row.get(0)?,
                     title: row.get::<_, Option<String>>(1)?,
                     extension: row.get::<_, Option<String>>(4)?,
+                    is_asset: row.get::<_, Option<bool>>(5)?.unwrap_or(false),
+                    is_pad: row.get::<_, Option<bool>>(6)?.unwrap_or(false),
                     expiration,
                     must_be_deleted: row.get::<_, Option<bool>>(3)?.unwrap_or(false),
                 })
@@ -734,105 +793,86 @@ impl Handler {
         Ok(ids)
     }
 
-    fn update(
-        &mut self,
-        id: Id,
-        write::DatabaseEntry { entry, data, nonce }: write::DatabaseEntry,
-    ) -> Result<write::Entry, Error> {
-        let title = entry.title.clone();
-        let nonce_slice = nonce.as_ref().map(|n| n.as_slice());
+    fn update_pad(&mut self, id: Id, update: write::PadUpdate) -> Result<Metadata, Error> {
         let updated_at = self.next_updated_at()?;
 
-        let affected = match entry.expires {
-            None => self.conn.execute(
-                "UPDATE entries SET data = ?2, extension = ?3, title = ?4, is_asset = ?5, updated_at = ?6, expires = NULL WHERE id = ?1",
-                params![id.to_i64(), data, entry.extension, title, entry.is_asset, &updated_at],
-            )?,
-            Some(expires) => self.conn.execute(
-                "UPDATE entries SET data = ?2, extension = ?3, title = ?4, is_asset = ?5, updated_at = ?6, expires = datetime('now', ?7) WHERE id = ?1",
-                params![
-                    id.to_i64(),
-                    data,
-                    entry.extension,
-                    title,
-                    entry.is_asset,
-                    &updated_at,
-                    format!("{expires} seconds"),
-                ],
-            )?,
-        };
+        let mut sql = String::from("UPDATE entries SET data = ?2, extension = ?3, updated_at = ?4");
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![
+            Box::new(id.to_i64()),
+            Box::new(update.data),
+            Box::new(update.extension),
+            Box::new(updated_at),
+        ];
 
-        if affected == 0 {
-            match entry.expires {
-                None => self.conn.execute(
-                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, title, extension, is_asset, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![
-                        id.to_i64(),
-                        entry.uid,
-                        data,
-                        entry.burn_after_reading,
-                        nonce_slice,
-                        title,
-                        entry.extension,
-                        entry.is_asset,
-                        &updated_at,
-                    ],
-                )?,
-                Some(expires) => self.conn.execute(
-                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, expires, title, extension, is_asset, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', ?6), ?7, ?8, ?9, ?10)",
-                    params![
-                        id.to_i64(),
-                        entry.uid,
-                        data,
-                        entry.burn_after_reading,
-                        nonce_slice,
-                        format!("{expires} seconds"),
-                        title,
-                        entry.extension,
-                        entry.is_asset,
-                        &updated_at,
-                    ],
-                )?,
-            };
+        if let Some(title) = update.title {
+            values.push(Box::new(title));
+            sql.push_str(&format!(", title = ?{}", values.len()));
         }
 
-        Ok(entry)
+        match update.expires {
+            None => {}
+            Some(None) => sql.push_str(", expires = NULL"),
+            Some(Some(expires)) => {
+                values.push(Box::new(format!("{expires} seconds")));
+                sql.push_str(&format!(", expires = datetime('now', ?{})", values.len()));
+            }
+        }
+
+        // Only live pads may be modified: this never touches encrypted, burn-after-reading or
+        // asset entries, and never creates a row for an unknown id.
+        sql.push_str(
+            " WHERE id = ?1 AND is_pad = 1 AND (expires IS NULL OR expires > datetime('now'))",
+        );
+
+        let affected = self
+            .conn
+            .execute(&sql, params_from_iter(values.iter().map(AsRef::as_ref)))?;
+
+        if affected == 0 {
+            return Err(Error::NotFound);
+        }
+
+        self.get_metadata(id)
+    }
+
+    fn delete_pad(&self, id: Id) -> Result<bool, Error> {
+        Ok(self.conn.execute(
+            "DELETE FROM entries WHERE id = ?1 AND is_pad = 1",
+            params![id.to_i64()],
+        )? != 0)
     }
 
     fn get_latest_pad_id(&self) -> Result<Option<Id>, Error> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id FROM entries WHERE (expires IS NULL OR expires > datetime('now')) AND IFNULL(is_asset, 0) = 0 AND IFNULL(burn_after_reading, 0) = 0 AND nonce IS NULL ORDER BY updated_at DESC, rowid DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query([])?;
-        if let Some(row) = rows.next()? {
-            let raw_id: i64 = row.get(0)?;
-            Ok(Some(Id::from(raw_id)))
-        } else {
-            Ok(None)
-        }
+        let id = self
+            .conn
+            .query_row(
+                "SELECT id FROM entries WHERE is_pad = 1 AND (expires IS NULL OR expires > datetime('now')) ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+
+        Ok(id.map(Id::from))
     }
 
     fn list_recent_pads(&self, limit: usize) -> Result<Vec<PadSummary>, Error> {
-        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(
-            "SELECT id, data, extension, updated_at, title FROM entries WHERE (expires IS NULL OR expires > datetime('now')) AND IFNULL(is_asset, 0) = 0 AND IFNULL(burn_after_reading, 0) = 0 AND nonce IS NULL ORDER BY updated_at DESC, rowid DESC LIMIT ?1",
+            "SELECT id, data, updated_at, title FROM entries WHERE is_pad = 1 AND (expires IS NULL OR expires > datetime('now')) ORDER BY updated_at DESC, rowid DESC LIMIT ?1",
         )?;
 
         let pads = stmt
-            .query_map(params![limit_i64], |row| {
-                let raw_id: i64 = row.get(0)?;
+            .query_map(params![limit], |row| {
                 let data: Vec<u8> = row.get(1)?;
-                let extension: Option<String> = row.get(2)?;
-                let updated_at: Option<String> = row.get(3)?;
-                let title: Option<String> = row.get(4)?;
-
-                let preview = Self::extract_preview(&data, title.as_deref());
+                let updated_at: Option<String> = row.get(2)?;
 
                 Ok(PadSummary {
-                    id: Id::from(raw_id).to_string(),
-                    extension,
-                    updated_at,
-                    preview,
+                    id: Id::from(row.get::<_, i64>(0)?).to_string(),
+                    title: row
+                        .get::<_, Option<String>>(3)?
+                        .filter(|title| !title.trim().is_empty()),
+                    preview: Self::extract_preview(&data),
+                    updated_at: updated_at.as_deref().and_then(to_rfc3339),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -840,52 +880,109 @@ impl Handler {
         Ok(pads)
     }
 
-    fn extract_preview(data: &[u8], title: Option<&str>) -> String {
-        if let Ok(decoded) = zstd::stream::decode_all(Cursor::new(data))
-            && let Ok(text) = std::str::from_utf8(&decoded)
-        {
-            let mut stripped = String::with_capacity(text.len().min(256));
-            let mut in_tag = false;
-            for ch in text.chars() {
-                match ch {
-                    '<' => {
-                        in_tag = true;
-                        stripped.push(' ');
+    /// First non-empty line of a pad's text. Markup is stripped and the content of `<figure>`
+    /// elements (inline images and PDFs with their captions) is skipped.
+    fn extract_preview(data: &[u8]) -> Option<String> {
+        const MAX_CHARS: usize = 48;
+
+        let decoded = zstd::stream::decode_all(Cursor::new(data)).ok()?;
+        let text = std::str::from_utf8(&decoded).ok()?;
+
+        let mut line = String::new();
+        let mut rest = text;
+        let mut figure_depth = 0usize;
+
+        while !rest.is_empty() {
+            let (chunk, tag) = match rest.find('<') {
+                Some(start) => match rest[start..].find('>') {
+                    Some(len) => (&rest[..start], Some(&rest[start + 1..start + len])),
+                    None => (rest, None),
+                },
+                None => (rest, None),
+            };
+
+            if figure_depth == 0 {
+                for ch in chunk.chars() {
+                    if ch == '\n' {
+                        if !line.trim().is_empty() {
+                            return Some(Self::finish_preview(&line, MAX_CHARS));
+                        }
+                        line.clear();
+                    } else {
+                        line.push(ch);
                     }
-                    '>' => {
-                        in_tag = false;
-                        stripped.push(' ');
-                    }
-                    _ if !in_tag => stripped.push(ch),
-                    _ => {}
-                }
-                if stripped.len() >= 512 {
-                    break;
                 }
             }
-            let stripped = stripped
-                .replace("&nbsp;", " ")
-                .replace("&amp;", "&")
-                .replace("&lt;", "<")
-                .replace("&gt;", ">")
-                .replace("&quot;", "\"")
-                .replace("&#39;", "'");
-            let single_line: String = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
-            if !single_line.is_empty() {
-                let mut preview: String = single_line.chars().take(48).collect();
-                if single_line.chars().count() > 48 {
-                    preview.push('…');
+
+            let Some(tag) = tag else { break };
+            rest = &rest[chunk.len() + tag.len() + 2..];
+
+            let name = tag
+                .trim_start_matches('/')
+                .split(|c: char| c.is_whitespace() || c == '/')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+
+            if name == "figure" {
+                if tag.starts_with('/') {
+                    figure_depth = figure_depth.saturating_sub(1);
+                } else {
+                    figure_depth += 1;
                 }
-                return preview;
+            } else if figure_depth == 0
+                && matches!(
+                    name.as_str(),
+                    "p" | "div"
+                        | "br"
+                        | "li"
+                        | "tr"
+                        | "pre"
+                        | "blockquote"
+                        | "hr"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                )
+            {
+                if !line.trim().is_empty() {
+                    return Some(Self::finish_preview(&line, MAX_CHARS));
+                }
+                line.clear();
+            } else if figure_depth == 0 {
+                line.push(' ');
             }
         }
 
-        if let Some(t) = title.map(str::trim).filter(|t| !t.is_empty()) {
-            return t.chars().take(48).collect();
-        }
-
-        "Untitled pad".to_string()
+        (!line.trim().is_empty()).then(|| Self::finish_preview(&line, MAX_CHARS))
     }
+
+    fn finish_preview(line: &str, max_chars: usize) -> String {
+        let line = line
+            .replace("&nbsp;", " ")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&amp;", "&");
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let mut preview: String = line.chars().take(max_chars).collect();
+        if line.chars().count() > max_chars {
+            preview.push('…');
+        }
+        preview
+    }
+}
+
+/// Convert an `updated_at` value (`YYYY-MM-DD HH:MM:SS.fff` in UTC, optionally followed by a
+/// write sequence suffix) into an RFC 3339 timestamp.
+fn to_rfc3339(value: &str) -> Option<String> {
+    let datetime = value.get(..23).or_else(|| value.get(..19))?;
+    Some(format!("{}Z", datetime.replacen(' ', "T", 1)))
 }
 
 impl Database {
@@ -974,7 +1071,7 @@ impl Database {
     }
 
     /// Delete paste with `id`. Returns whether the entry was still present.
-    pub async fn delete(&self, id: Id) -> Result<bool, Error> {
+    async fn delete(&self, id: Id) -> Result<bool, Error> {
         let (result, command_result) = oneshot::channel();
         self.sender
             .send(Command::Delete { id, result })
@@ -1037,20 +1134,57 @@ impl Database {
         command_result.await?
     }
 
-    /// Update (or upsert if not found) `entry` under `id` in the database.
-    pub async fn update(&self, id: Id, entry: write::Entry) -> Result<write::Entry, Error> {
-        let entry = entry.compress().await?.encrypt().await?;
+    /// Get the content of the live pad `id`. Entries that are not pads (regular, encrypted,
+    /// burn-after-reading pastes or assets) are reported as [`Error::NotFound`] without being
+    /// read, so that a burn-after-reading paste is not burned.
+    pub async fn get_pad(&self, id: Id) -> Result<read::Data, Error> {
+        if !self.get_metadata(id).await?.is_pad {
+            return Err(Error::NotFound);
+        }
+
+        match self.get(id, None).await? {
+            read::Entry::Regular(data) => Ok(data),
+            read::Entry::Burned(_) | read::Entry::Encrypted(_) => Err(Error::NotFound),
+        }
+    }
+
+    /// Replace the content of the live pad `id` and return its updated metadata. Fails with
+    /// [`Error::NotFound`] if `id` is not a live pad.
+    pub async fn update_pad(
+        &self,
+        id: Id,
+        text: &str,
+        extension: Option<String>,
+        title: Option<Option<String>>,
+        expires: Option<Option<NonZeroU32>>,
+    ) -> Result<Metadata, Error> {
+        let update = write::PadUpdate {
+            data: write::compress_text(text).await?,
+            extension,
+            title,
+            expires,
+        };
 
         let (result, command_result) = oneshot::channel();
         self.sender
-            .send(Command::Update { id, entry, result })
+            .send(Command::UpdatePad { id, update, result })
             .await
             .map_err(|_| Error::SendError)?;
 
         command_result.await?
     }
 
-    /// Retrieve the most recently updated non-expired, non-asset, non-encrypted, non-burn pad.
+    /// Delete the live pad `id`. Returns `false` if `id` is not a pad.
+    pub async fn delete_pad(&self, id: Id) -> Result<bool, Error> {
+        let (result, command_result) = oneshot::channel();
+        self.sender
+            .send(Command::DeletePad { id, result })
+            .await
+            .map_err(|_| Error::SendError)?;
+        command_result.await?
+    }
+
+    /// Retrieve the most recently updated live pad.
     pub async fn get_latest_pad(&self) -> Result<Option<(Id, read::Data)>, Error> {
         let (result, command_result) = oneshot::channel();
         self.sender
@@ -1062,18 +1196,14 @@ impl Database {
             return Ok(None);
         };
 
-        match self.get(id, None).await {
-            Ok(
-                read::Entry::Regular(data)
-                | read::Entry::Burned(data)
-                | read::Entry::Encrypted(data),
-            ) => Ok(Some((id, data))),
+        match self.get_pad(id).await {
+            Ok(data) => Ok(Some((id, data))),
             Err(Error::NotFound) => Ok(None),
             Err(err) => Err(err),
         }
     }
 
-    /// List recent non-expired, non-asset, non-encrypted, non-burn pads ordered by most recently updated.
+    /// List live pads, most recently updated first.
     pub async fn list_recent_pads(&self, limit: usize) -> Result<Vec<read::PadSummary>, Error> {
         let (result, command_result) = oneshot::channel();
         self.sender
@@ -1359,21 +1489,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn binary_data_url_and_extension() -> Result<(), Box<dyn std::error::Error>> {
+    async fn asset_data_url_is_decoded() -> Result<(), Box<dyn std::error::Error>> {
         let db = new_db()?;
 
         // Base64 of [1, 2, 3, 4, 5] is AQIDBAU=
-        let entry = write::Entry {
-            text: "data:image/png;base64,AQIDBAU=".to_string(),
-            title: Some("test.png".to_string()),
-            ..Default::default()
-        };
-
-        let (id, entry) = db.insert(entry).await?;
+        let (id, entry) = db
+            .insert(write::Entry {
+                text: "data:image/png;base64,AQIDBAU=".to_string(),
+                title: Some("test.png".to_string()),
+                is_asset: true,
+                ..Default::default()
+            })
+            .await?;
         assert_eq!(entry.extension.as_deref(), Some("png"));
 
         let metadata = db.get_metadata(id).await?;
         assert_eq!(metadata.extension.as_deref(), Some("png"));
+        assert!(metadata.is_asset);
 
         let data = db.get(id, None).await?.unwrap_inner();
         assert_eq!(data.bytes, vec![1, 2, 3, 4, 5]);
@@ -1382,66 +1514,141 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_and_upsert() -> Result<(), Box<dyn std::error::Error>> {
+    async fn paste_data_url_is_kept_as_text() -> Result<(), Box<dyn std::error::Error>> {
         let db = new_db()?;
 
-        // Upsert on non-existent ID
-        let id = Id::from(12345u32);
-        let entry = write::Entry {
-            text: "initial content".to_string(),
-            extension: Some("md".to_string()),
-            title: Some("First Title".to_string()),
+        let text = "data:image/png;base64,AQIDBAU=";
+        let (id, entry) = db
+            .insert(write::Entry {
+                text: text.to_string(),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(entry.extension, None);
+
+        let data = db.get(id, None).await?.unwrap_inner();
+        assert_eq!(data.text, text);
+        assert!(!data.metadata.is_asset);
+
+        Ok(())
+    }
+
+    fn pad(text: &str) -> write::Entry {
+        write::Entry {
+            text: text.to_string(),
+            extension: Some("txt".to_string()),
+            is_pad: true,
             ..Default::default()
-        };
-        db.update(id, entry).await?;
+        }
+    }
 
-        let fetched = db.get(id, None).await?.unwrap_inner();
-        assert_eq!(fetched.text, "initial content");
-        assert_eq!(fetched.metadata.extension.as_deref(), Some("md"));
-        assert_eq!(fetched.metadata.title.as_deref(), Some("First Title"));
+    #[tokio::test]
+    async fn update_pad_keeps_metadata() -> Result<(), Box<dyn std::error::Error>> {
+        let db = new_db()?;
 
-        // Update existing ID
-        let updated_entry = write::Entry {
-            text: "updated content".to_string(),
-            extension: Some("html".to_string()),
-            title: Some("Updated Title".to_string()),
-            expires: Some(NonZeroU32::new(3600).unwrap()),
-            ..Default::default()
-        };
-        db.update(id, updated_entry).await?;
+        let (id, _) = db
+            .insert(write::Entry {
+                title: Some("notes".to_string()),
+                expires: NonZeroU32::new(3600),
+                ..pad("initial")
+            })
+            .await?;
 
-        let fetched2 = db.get(id, None).await?.unwrap_inner();
-        assert_eq!(fetched2.text, "updated content");
-        assert_eq!(fetched2.metadata.extension.as_deref(), Some("html"));
-        assert_eq!(fetched2.metadata.title.as_deref(), Some("Updated Title"));
-        assert!(fetched2.metadata.expiration.is_some());
+        let metadata = db
+            .update_pad(id, "updated", Some("md".to_string()), None, None)
+            .await?;
+        assert_eq!(metadata.title.as_deref(), Some("notes"));
+        assert!(metadata.expiration.is_some());
+
+        let data = db.get_pad(id).await?;
+        assert_eq!(data.text, "updated");
+        assert_eq!(data.metadata.extension.as_deref(), Some("md"));
+
+        let metadata = db
+            .update_pad(id, "updated", None, Some(None), Some(None))
+            .await?;
+        assert_eq!(metadata.title, None);
+        assert!(metadata.expiration.is_none());
 
         Ok(())
     }
 
     #[tokio::test]
-    async fn latest_pad_and_recent_pads_ignore_assets() -> Result<(), Box<dyn std::error::Error>> {
+    async fn pad_api_refuses_other_entries() -> Result<(), Box<dyn std::error::Error>> {
+        let db = new_db()?;
+
+        let (encrypted, _) = db
+            .insert(write::Entry {
+                text: "secret".to_string(),
+                password: Some("hunter2".to_string()),
+                ..Default::default()
+            })
+            .await?;
+        let (burn, _) = db
+            .insert(write::Entry {
+                text: "burn".to_string(),
+                burn_after_reading: Some(true),
+                ..Default::default()
+            })
+            .await?;
+        let (paste, _) = db
+            .insert(write::Entry {
+                text: "paste".to_string(),
+                ..Default::default()
+            })
+            .await?;
+
+        for id in [encrypted, burn, paste, Id::from(12345u32)] {
+            assert!(matches!(db.get_pad(id).await, Err(Error::NotFound)));
+            assert!(matches!(
+                db.update_pad(id, "clobbered", None, None, None).await,
+                Err(Error::NotFound)
+            ));
+            assert!(!db.delete_pad(id).await?);
+        }
+
+        // Nothing was burned, modified or inserted.
+        let password = Password::from("hunter2".as_bytes().to_vec());
+        assert_eq!(
+            db.get(encrypted, Some(password)).await?.unwrap_inner().text,
+            "secret"
+        );
+        assert_eq!(db.get(burn, None).await?.unwrap_inner().text, "burn");
+        assert_eq!(db.get(paste, None).await?.unwrap_inner().text, "paste");
+        assert!(matches!(
+            db.get(Id::from(12345u32), None).await,
+            Err(Error::NotFound)
+        ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_and_recent_pads_list_only_pads() -> Result<(), Box<dyn std::error::Error>> {
         let db = new_db()?;
 
         assert!(db.get_latest_pad().await?.is_none());
 
         let (pad1_id, _) = db
             .insert(write::Entry {
-                text: "<p>Hello <b>Rich Text</b> World</p>".to_string(),
-                extension: Some("html".to_string()),
-                ..Default::default()
+                extension: Some("rich".to_string()),
+                ..pad("<figure class=\"inline-asset\"><img src=\"/raw/x.png\"><figcaption>image.png · 100 KB</figcaption></figure><p>Hello <b>rich</b> &amp; world</p><p>second</p>")
             })
             .await?;
 
         let (pad2_id, _) = db
             .insert(write::Entry {
-                text: "# Second Pad\nSome markdown here".to_string(),
-                extension: Some("md".to_string()),
-                ..Default::default()
+                title: Some("todo".to_string()),
+                ..pad("\n\n# Second Pad\nSome markdown here")
             })
             .await?;
 
-        // Insert an asset after pad2 — should be ignored by get_latest_pad and list_recent_pads
+        // Neither a regular paste nor an asset is a pad.
+        db.insert(write::Entry {
+            text: "regular paste".to_string(),
+            ..Default::default()
+        })
+        .await?;
         db.insert(write::Entry {
             text: "data:image/png;base64,AQIDBAU=".to_string(),
             is_asset: true,
@@ -1451,14 +1658,22 @@ mod tests {
 
         let (latest_id, latest_data) = db.get_latest_pad().await?.expect("latest pad exists");
         assert_eq!(latest_id, pad2_id);
-        assert_eq!(latest_data.text, "# Second Pad\nSome markdown here");
+        assert_eq!(latest_data.text, "\n\n# Second Pad\nSome markdown here");
 
         let recents = db.list_recent_pads(10).await?;
         assert_eq!(recents.len(), 2);
         assert_eq!(recents[0].id, pad2_id.to_string());
-        assert_eq!(recents[0].preview, "# Second Pad Some markdown here");
+        assert_eq!(recents[0].title.as_deref(), Some("todo"));
+        assert_eq!(recents[0].preview.as_deref(), Some("# Second Pad"));
+        assert!(
+            recents[0]
+                .updated_at
+                .as_deref()
+                .is_some_and(|t| t.ends_with('Z'))
+        );
         assert_eq!(recents[1].id, pad1_id.to_string());
-        assert_eq!(recents[1].preview, "Hello Rich Text World");
+        assert_eq!(recents[1].title, None);
+        assert_eq!(recents[1].preview.as_deref(), Some("Hello rich & world"));
 
         Ok(())
     }

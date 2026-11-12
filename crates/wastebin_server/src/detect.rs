@@ -1,7 +1,5 @@
 use serde::Serialize;
-use wastebin_core::id::Id;
 
-use crate::cache::{Cache, Key, Mode};
 use crate::Highlighter;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -143,7 +141,9 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
             abap_score += 3;
         }
     }
-    for kw in ["SELECT ", "CLASS ", "METHOD ", "APPEND ", "lt_", "ls_", "lv_"] {
+    for kw in [
+        "SELECT ", "CLASS ", "METHOD ", "APPEND ", "lt_", "ls_", "lv_",
+    ] {
         if content.contains(kw) || upper.contains(kw) {
             abap_score += 1;
         }
@@ -294,7 +294,15 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
     {
         sh_score += 10;
     }
-    for kw in ["set -e", "echo $", "sudo ", "docker compose", "export ", "fi\n", "done\n"] {
+    for kw in [
+        "set -e",
+        "echo $",
+        "sudo ",
+        "docker compose",
+        "export ",
+        "fi\n",
+        "done\n",
+    ] {
         if content.contains(kw) {
             sh_score += 2;
         }
@@ -365,8 +373,10 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
                 !t.is_empty()
                     && !t.starts_with('#')
                     && t.contains(": ")
-                    && t.split_once(": ")
-                        .is_some_and(|(k, _)| k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                    && t.split_once(": ").is_some_and(|(k, _)| {
+                        k.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                    })
             })
             .count();
         if kv_lines >= 3 {
@@ -375,7 +385,7 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
     }
     scores.push(("yaml", "YAML", yaml_score));
 
-    scores.sort_by(|a, b| b.2.cmp(&a.2));
+    scores.sort_by_key(|score| std::cmp::Reverse(score.2));
     if let Some(&(ext, name, score)) = scores.first()
         && score >= 3
     {
@@ -393,14 +403,19 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
     }
 }
 
-/// Highlight `text` using `highlighter` (falling back to `"sql"` syntax for `"abap"` if syntect has no built-in ABAP syntax).
-pub async fn highlight_code(
-    highlighter: Highlighter,
-    cache: Cache,
-    id: Option<Id>,
-    text: String,
-    ext: String,
-) -> Option<String> {
+/// Whether a pad with extension `ext` and content `text` was written in document mode. Older
+/// pads stored document markup under the `html` extension.
+pub fn is_document(ext: Option<&str>, text: &str) -> bool {
+    match ext {
+        Some(ext) if ext.eq_ignore_ascii_case("rich") => true,
+        Some(ext) if ext.eq_ignore_ascii_case("html") => has_rich_inline_html(text),
+        _ => false,
+    }
+}
+
+/// Highlight `text` using `highlighter` (falling back to `"sql"` syntax for `"abap"` if syntect has
+/// no built-in ABAP syntax). The result is not cached because pads change on every keystroke.
+pub async fn highlight_code(highlighter: Highlighter, text: String, ext: String) -> Option<String> {
     if text.is_empty() {
         return None;
     }
@@ -408,24 +423,13 @@ pub async fn highlight_code(
     let syntax_ext = if ext.eq_ignore_ascii_case("abap") {
         "sql".to_string()
     } else {
-        ext.clone()
+        ext
     };
 
     let html = tokio::task::spawn_blocking(move || highlighter.highlight(text, Some(syntax_ext)))
         .await
         .ok()?
         .ok()?;
-
-    if let Some(id) = id {
-        cache.put(
-            &Key {
-                id,
-                ext: Some(ext),
-            },
-            Mode::Source,
-            html.clone(),
-        );
-    }
 
     Some(html.into_inner())
 }
@@ -463,7 +467,8 @@ mod tests {
 
     #[test]
     fn detects_php() {
-        let code = "<?php\nnamespace App\\Controller;\npublic function index() {\n  echo $_GET['id'];\n}";
+        let code =
+            "<?php\nnamespace App\\Controller;\npublic function index() {\n  echo $_GET['id'];\n}";
         let detected = detect_language(code, None);
         assert_eq!(detected.extension, "php");
         assert_eq!(detected.name, "PHP");

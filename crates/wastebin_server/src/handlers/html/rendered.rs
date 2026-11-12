@@ -90,11 +90,7 @@ pub async fn get<E>(
             Err(err) => return Err(err.into()),
         };
 
-        let Data {
-            text,
-            metadata,
-            ..
-        } = data;
+        let Data { text, metadata, .. } = data;
         let Metadata {
             uid: owner_uid,
             title,
@@ -107,22 +103,26 @@ pub async fn get<E>(
             _ => false,
         };
 
-        let html = if let Some(cached) = cache.get(&key, Mode::Rendered) {
-            tracing::trace!(?key, "found cached rendered markdown");
-            cached.into_inner()
-        } else {
-            let highlighter = highlighter.clone();
-            let rendered =
-                tokio::task::spawn_blocking(move || markdown::render(&text, &highlighter))
-                    .await??;
+        // Pads change all the time, so their HTML is never cached.
+        let cacheable = is_available && no_password && !metadata.is_pad;
 
-            if is_available && no_password {
-                tracing::trace!(?key, "cache rendered markdown");
-                cache.put(&key, Mode::Rendered, rendered.clone());
-            }
+        let html =
+            if let Some(cached) = cacheable.then(|| cache.get(&key, Mode::Rendered)).flatten() {
+                tracing::trace!(?key, "found cached rendered markdown");
+                cached.into_inner()
+            } else {
+                let highlighter = highlighter.clone();
+                let rendered =
+                    tokio::task::spawn_blocking(move || markdown::render(&text, &highlighter))
+                        .await??;
 
-            rendered.into_inner()
-        };
+                if cacheable {
+                    tracing::trace!(?key, "cache rendered markdown");
+                    cache.put(&key, Mode::Rendered, rendered.clone());
+                }
+
+                rendered.into_inner()
+            };
 
         let rendered = Rendered {
             page: page.clone(),

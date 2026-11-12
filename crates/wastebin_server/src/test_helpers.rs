@@ -93,4 +93,20 @@ impl Client {
     pub(crate) fn delete(&self, url: &str) -> RequestBuilder {
         self.client.delete(format!("http://{}{}", self.addr, url))
     }
+
+    /// Upload an asset through the pad API and return its `/raw/` URL.
+    pub(crate) async fn upload_asset(
+        &self,
+        data_url: &str,
+        filename: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let res = self
+            .post("/api/asset")
+            .json(&serde_json::json!({ "data_url": data_url, "filename": filename }))
+            .send()
+            .await?;
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+        let body = res.json::<serde_json::Value>().await?;
+        Ok(body["url"].as_str().expect("asset url").to_string())
+    }
 }

@@ -28,6 +28,12 @@ pub fn render(text: &str, highlighter: &Highlighter) -> Result<Html, Error> {
     Ok(Html::new(sanitizer().clean(&raw).to_string()))
 }
 
+/// Sanitize the HTML of a document-mode pad for display, with the same allowlist as rendered
+/// Markdown.
+pub fn sanitize(html: &str) -> Html {
+    Html::new(sanitizer().clean(html).to_string())
+}
+
 fn rewrite_events<'a>(
     parser: Parser<'a>,
     highlighter: &Highlighter,
@@ -94,6 +100,22 @@ mod tests {
 
     fn render_string(text: &str, highlighter: &Highlighter) -> Result<String, Error> {
         render(text, highlighter).map(Html::into_inner)
+    }
+
+    #[test]
+    fn sanitize_strips_scripts_and_keeps_figures() {
+        let html = sanitize(
+            "<figure class=\"inline-asset\"><img src=\"/raw/a.png\" onerror=\"x()\"><figcaption>a</figcaption></figure><script>x()</script><iframe src=\"/raw/b.pdf\"></iframe>",
+        )
+        .into_inner();
+        assert!(
+            html.contains("<figure class=\"inline-asset\">"),
+            "got: {html}"
+        );
+        assert!(html.contains("<img src=\"/raw/a.png\">"), "got: {html}");
+        assert!(!html.contains("onerror"), "got: {html}");
+        assert!(!html.contains("script"), "got: {html}");
+        assert!(!html.contains("iframe"), "got: {html}");
     }
 
     #[test]

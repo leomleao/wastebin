@@ -88,25 +88,12 @@ impl Cache {
             .cloned()
     }
 
+    /// Evict every cached representation of `id`, whatever its extension or mode.
     pub fn remove(&self, id: Id) {
-        let mut cache = self.inner.lock().expect("getting lock");
-        for mode in [Mode::Source, Mode::Rendered] {
-            let _ = cache.cache_remove(&Slot {
-                id,
-                ext: None,
-                mode: mode.clone(),
-            });
-            for ext in [
-                "rs", "js", "ts", "py", "php", "abap", "sql", "md", "json", "html", "css", "sh",
-                "yaml", "yml", "txt", "rich", "go", "c", "cpp", "java", "toml", "xml",
-            ] {
-                let _ = cache.cache_remove(&Slot {
-                    id,
-                    ext: Some(ext.to_string()),
-                    mode: mode.clone(),
-                });
-            }
-        }
+        self.inner
+            .lock()
+            .expect("getting lock")
+            .retain(|slot, _| slot.id != id);
     }
 }
 
