@@ -36,7 +36,7 @@ impl From<Entry> for write::Entry {
 
         Self {
             text: entry.text,
-            extension: entry.extension,
+            extension: entry.extension.filter(|s| !s.is_empty()),
             expires,
             burn_after_reading,
             uid: None,

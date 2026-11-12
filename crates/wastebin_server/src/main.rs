@@ -4,6 +4,7 @@ mod env;
 mod errors;
 mod handlers;
 mod i18n;
+pub(crate) mod media;
 mod page;
 #[cfg(test)]
 mod test_helpers;
@@ -85,10 +86,10 @@ impl FromRef<AppState> for Cache {
 async fn security_headers_layer(req: Request, next: Next) -> impl IntoResponse {
     // Rendered Markdown may embed remote images via `![](…)`; relax img-src for that route only.
     const CSP_STRICT: HeaderValue = HeaderValue::from_static(
-        "default-src 'none'; script-src 'self'; img-src 'self' data: ; style-src 'self' data: ; font-src 'self' data: ; object-src 'none' ; base-uri 'none' ; frame-ancestors 'none' ; form-action 'self' ;",
+        "default-src 'none'; script-src 'self'; img-src 'self' data: ; style-src 'self' data: ; font-src 'self' data: ; object-src 'self' ; frame-src 'self' data: ; base-uri 'none' ; frame-ancestors 'self' ; form-action 'self' ;",
     );
     const CSP_RENDERED: HeaderValue = HeaderValue::from_static(
-        "default-src 'none'; script-src 'self'; img-src * data: ; style-src 'self' data: ; font-src 'self' data: ; object-src 'none' ; base-uri 'none' ; frame-ancestors 'none' ; form-action 'self' ;",
+        "default-src 'none'; script-src 'self'; img-src * data: ; style-src 'self' data: ; font-src 'self' data: ; object-src 'self' ; frame-src 'self' data: ; base-uri 'none' ; frame-ancestors 'self' ; form-action 'self' ;",
     );
 
     let csp = if req.uri().path().starts_with("/md/") {
@@ -97,7 +98,10 @@ async fn security_headers_layer(req: Request, next: Next) -> impl IntoResponse {
         CSP_STRICT
     };
 
-    let headers: [(HeaderName, HeaderValue); 7] = [
+    let mut res = next.run(req).await.into_response();
+    let res_headers = res.headers_mut();
+
+    for (name, value) in [
         (SERVER, HeaderValue::from_static(env!("CARGO_PKG_NAME"))),
         (CONTENT_SECURITY_POLICY, csp),
         (REFERRER_POLICY, HeaderValue::from_static("same-origin")),
@@ -108,9 +112,13 @@ async fn security_headers_layer(req: Request, next: Next) -> impl IntoResponse {
             HeaderValue::from_static("none"),
         ),
         (X_XSS_PROTECTION, HeaderValue::from_static("1; mode=block")),
-    ];
+    ] {
+        if !res_headers.contains_key(&name) {
+            res_headers.insert(name, value);
+        }
+    }
 
-    (headers, next.run(req).await)
+    res
 }
 
 async fn handle_service_errors(
@@ -219,7 +227,7 @@ fn make_app(state: AppState, timeout: Duration, max_body_size: usize) -> Router 
         .route("/delete/{id}", post(delete::form::delete))
         .layer(
             ServiceBuilder::new()
-                .layer(DefaultBodyLimit::max(max_body_size))
+                .layer(DefaultBodyLimit::max(max_body_size.saturating_mul(3) / 2))
                 .layer(
                     CompressionLayer::new()
                         .compress_when(DefaultPredicate::new().and(SizeAbove::new(256))),

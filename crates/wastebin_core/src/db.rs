@@ -153,8 +153,46 @@ pub mod write {
 
     impl Entry {
         /// Compress the entry for insertion.
-        pub async fn compress(self) -> Result<CompressedEntry, Error> {
-            let mut encoder = ZstdEncoder::new(Cursor::new(&self.text));
+        pub async fn compress(mut self) -> Result<CompressedEntry, Error> {
+            let bytes = if let Some(payload) = self.text.strip_prefix("data:") {
+                if let Some((header, b64)) = payload.split_once(";base64,") {
+                    use base64::Engine;
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(b64.trim())
+                        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b64.trim()));
+
+                    if let Ok(decoded_bytes) = decoded {
+                        if self.extension.is_none() {
+                            let mime = header.trim();
+                            let ext = match mime {
+                                "image/png" => Some("png"),
+                                "image/jpeg" | "image/jpg" => Some("jpg"),
+                                "image/gif" => Some("gif"),
+                                "image/webp" => Some("webp"),
+                                "image/svg+xml" => Some("svg"),
+                                "image/avif" => Some("avif"),
+                                "image/bmp" => Some("bmp"),
+                                "image/x-icon" | "image/vnd.microsoft.icon" => Some("ico"),
+                                "image/tiff" => Some("tiff"),
+                                "application/pdf" => Some("pdf"),
+                                _ => None,
+                            };
+                            if let Some(ext) = ext {
+                                self.extension = Some(ext.to_string());
+                            }
+                        }
+                        decoded_bytes
+                    } else {
+                        self.text.as_bytes().to_vec()
+                    }
+                } else {
+                    self.text.as_bytes().to_vec()
+                }
+            } else {
+                self.text.as_bytes().to_vec()
+            };
+
+            let mut encoder = ZstdEncoder::new(Cursor::new(bytes));
             let mut data = Vec::new();
 
             encoder
@@ -227,8 +265,10 @@ pub mod read {
     /// Uncompressed entry
     #[derive(Debug)]
     pub struct UncompressedEntry {
-        /// Content
+        /// Content as string (empty if binary/not valid UTF-8)
         pub text: String,
+        /// Raw content bytes
+        pub bytes: Vec<u8>,
         /// Metadata
         pub metadata: Metadata,
         /// Entry must be deleted
@@ -238,8 +278,10 @@ pub mod read {
     /// Uncompressed, decrypted data read from the database.
     #[derive(Debug)]
     pub struct Data {
-        /// Content
+        /// Content as string (empty if binary/not valid UTF-8)
         pub text: String,
+        /// Raw content bytes
+        pub bytes: Vec<u8>,
         /// Metadata
         pub metadata: Metadata,
     }
@@ -251,6 +293,8 @@ pub mod read {
         pub uid: Option<i64>,
         /// Title
         pub title: Option<String>,
+        /// File extension
+        pub extension: Option<String>,
         /// Entry expiration datetime
         pub expiration: Option<Expiration>,
         /// Entry will be deleted the next time it is fetched via [`Database::get`].
@@ -311,14 +355,17 @@ pub mod read {
     impl CompressedReadEntry {
         pub async fn decompress(self) -> Result<UncompressedEntry, Error> {
             let mut decoder = ZstdDecoder::new(Cursor::new(self.data));
-            let mut text = String::new();
+            let mut bytes = Vec::new();
 
             decoder
-                .read_to_string(&mut text)
+                .read_to_end(&mut bytes)
                 .await
                 .map_err(|e| Error::Compression(e.to_string()))?;
 
+            let text = std::str::from_utf8(&bytes).map(str::to_owned).unwrap_or_default();
+
             Ok(UncompressedEntry {
+                bytes,
                 text,
                 metadata: self.metadata,
                 must_be_deleted: self.must_be_deleted,
@@ -381,6 +428,7 @@ impl Handler {
             M::up(include_str!("migrations/0005-drop-text-column.sql")),
             M::up(include_str!("migrations/0006-add-nonce-column.sql")),
             M::up(include_str!("migrations/0007-add-title-column.sql")),
+            M::up(include_str!("migrations/0008-add-extension-column.sql")),
         ]);
 
         migrations.to_latest(&mut conn)?;
@@ -445,11 +493,11 @@ impl Handler {
 
             let result = match entry.expires {
                 None => self.conn.execute(
-                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, title) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![id.to_i64(), entry.uid, data, entry.burn_after_reading, nonce, title],
+                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, title, extension) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![id.to_i64(), entry.uid, data, entry.burn_after_reading, nonce, title, entry.extension],
                 ),
                 Some(expires) => self.conn.execute(
-                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, expires, title) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', ?6), ?7)",
+                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, expires, title, extension) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', ?6), ?7, ?8)",
                     params![
                         id.to_i64(),
                         entry.uid,
@@ -458,6 +506,7 @@ impl Handler {
                         nonce,
                         format!("{expires} seconds"),
                         title,
+                        entry.extension,
                     ],
                 ),
             };
@@ -488,7 +537,7 @@ impl Handler {
 
     fn get_metadata(&self, id: Id) -> Result<Metadata, Error> {
         let metadata = self.conn.query_row(
-            "SELECT uid, title, CAST(ROUND((julianday(expires) - julianday('now')) * 86400) AS INTEGER), burn_after_reading FROM entries WHERE id=?1",
+            "SELECT uid, title, CAST(ROUND((julianday(expires) - julianday('now')) * 86400) AS INTEGER), burn_after_reading, extension FROM entries WHERE id=?1",
             params![id.to_i64()],
             |row| {
                 let expiration = row.get::<_, Option<i64>>(2)?
@@ -499,6 +548,7 @@ impl Handler {
                 Ok(read::Metadata {
                     uid: row.get(0)?,
                     title: row.get::<_, Option<String>>(1)?,
+                    extension: row.get::<_, Option<String>>(4)?,
                     expiration,
                     must_be_deleted: row.get::<_, Option<bool>>(3)?.unwrap_or(false),
                 })
@@ -662,12 +712,17 @@ impl Database {
         let is_encrypted = entry.nonce.is_some();
 
         let read::UncompressedEntry {
+            bytes,
             text,
             metadata,
             must_be_deleted,
         } = entry.decrypt(password).await?.decompress().await?;
 
-        let data = read::Data { text, metadata };
+        let data = read::Data {
+            bytes,
+            text,
+            metadata,
+        };
 
         // Whether this fetch burned the paste.
         let burned = if must_be_deleted {
@@ -1034,6 +1089,29 @@ mod tests {
             .await?;
         assert!(matches!(entry, read::Entry::Encrypted(_)));
         assert!(entry.unwrap_inner().metadata.must_be_deleted);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn binary_data_url_and_extension() -> Result<(), Box<dyn std::error::Error>> {
+        let db = new_db()?;
+
+        // Base64 of [1, 2, 3, 4, 5] is AQIDBAU=
+        let entry = write::Entry {
+            text: "data:image/png;base64,AQIDBAU=".to_string(),
+            title: Some("test.png".to_string()),
+            ..Default::default()
+        };
+
+        let (id, entry) = db.insert(entry).await?;
+        assert_eq!(entry.extension.as_deref(), Some("png"));
+
+        let metadata = db.get_metadata(id).await?;
+        assert_eq!(metadata.extension.as_deref(), Some("png"));
+
+        let data = db.get(id, None).await?.unwrap_inner();
+        assert_eq!(data.bytes, vec![1, 2, 3, 4, 5]);
 
         Ok(())
     }

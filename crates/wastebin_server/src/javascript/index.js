@@ -139,15 +139,26 @@ function formatSize(bytes) {
 
 $("progress-limit").textContent = LABEL_LIMIT + " " + formatSize(MAX_BYTES);
 
+const submitButton = document.querySelector('button[type="submit"]');
+
+let currentMediaFile = null;
+let currentObjectUrl = null;
+
 function updateStats() {
   const text = textarea.value;
-  const lines = Math.max(1, text.split("\n").length);
-  const chars = text.length;
   let bytes;
-  try { bytes = new Blob([text]).size; } catch(e) { bytes = text.length; }
+  if (currentMediaFile) {
+    bytes = currentMediaFile.size;
+    $("stat-lines").textContent = "1";
+    $("stat-chars").textContent = bytes;
+  } else {
+    const lines = Math.max(1, text.split("\n").length);
+    const chars = text.length;
+    try { bytes = new Blob([text]).size; } catch(e) { bytes = text.length; }
+    $("stat-lines").textContent = lines;
+    $("stat-chars").textContent = chars;
+  }
 
-  $("stat-lines").textContent = lines;
-  $("stat-chars").textContent = chars;
   $("stat-bytes").textContent = bytes.toLocaleString();
 
   const pct = Math.min(100, (bytes / MAX_BYTES) * 100);
@@ -223,6 +234,163 @@ editorWrap.addEventListener("dragover", function(e) {
   e.preventDefault();
 });
 
+function ensureExtensionOption(ext, label) {
+  ext = ext.toLowerCase();
+  for (let i = 0; i < langSelect.options.length; i++) {
+    if (langSelect.options[i].value.toLowerCase() === ext) {
+      langSelect.options[i].selected = true;
+      return;
+    }
+  }
+  const opt = document.createElement("option");
+  opt.value = ext;
+  opt.textContent = label || ext.toUpperCase();
+  opt.selected = true;
+  langSelect.prepend(opt);
+}
+
+function isImageFile(file) {
+  if (file.type && file.type.startsWith("image/")) return true;
+  const name = (file.name || "").toLowerCase();
+  return /\.(png|jpe?g|gif|webp|svg|avif|bmp|ico|tiff?)$/i.test(name);
+}
+
+function isPdfFile(file) {
+  if (file.type === "application/pdf") return true;
+  const name = (file.name || "").toLowerCase();
+  return /\.pdf$/i.test(name);
+}
+
+function loadMediaFile(file, type) {
+  if (currentObjectUrl) {
+    URL.revokeObjectURL(currentObjectUrl);
+    currentObjectUrl = null;
+  }
+  currentMediaFile = file;
+  editorWrap.classList.add("editor-media-mode");
+  const mediaPreview = $("media-preview");
+  const imgBox = $("preview-image-box");
+  const pdfBox = $("preview-pdf-box");
+  const previewImg = $("preview-image");
+
+  mediaPreview.classList.remove("hidden");
+
+  const name = file.name || (type === "image" ? generateScreenshotName() : "document.pdf");
+  const dot = name.lastIndexOf(".");
+  let ext = dot > 0 ? name.slice(dot + 1).toLowerCase() : (type === "image" ? "png" : "pdf");
+
+  $("title").value = name;
+  ensureExtensionOption(ext, ext.toUpperCase() + (type === "image" ? " Image" : " Document"));
+
+  if (type === "image") {
+    imgBox.classList.remove("hidden");
+    pdfBox.classList.add("hidden");
+    currentObjectUrl = URL.createObjectURL(file);
+    previewImg.src = currentObjectUrl;
+  } else {
+    imgBox.classList.add("hidden");
+    pdfBox.classList.remove("hidden");
+    $("preview-filename").textContent = name;
+    $("preview-filesize").textContent = formatSize(file.size);
+  }
+
+  const reader = new FileReader();
+  if (submitButton) {
+    submitButton.disabled = true;
+  }
+  reader.onload = function(e) {
+    textarea.value = e.target.result;
+    updateStats();
+  };
+  reader.onloadend = function() {
+    if (submitButton) {
+      submitButton.disabled = false;
+    }
+  };
+  reader.readAsDataURL(file);
+}
+
+function removeMedia() {
+  if (currentObjectUrl) {
+    URL.revokeObjectURL(currentObjectUrl);
+    currentObjectUrl = null;
+  }
+  currentMediaFile = null;
+  editorWrap.classList.remove("editor-media-mode");
+  $("media-preview").classList.add("hidden");
+  $("preview-image-box").classList.add("hidden");
+  $("preview-pdf-box").classList.add("hidden");
+  $("preview-image").src = "";
+  textarea.value = "";
+  $("title").value = "";
+  langSelect.value = "";
+  updateLineNumbers();
+  updateStats();
+}
+
+const mediaRemoveBtn = $("media-remove");
+if (mediaRemoveBtn) {
+  mediaRemoveBtn.addEventListener("click", removeMedia);
+}
+
+function generateScreenshotName() {
+  const d = new Date();
+  const pad = n => String(n).padStart(2, "0");
+  return `Screenshot ${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} at ${pad(d.getHours())}.${pad(d.getMinutes())}.${pad(d.getSeconds())}.png`;
+}
+
+function loadTextFile(file) {
+  removeMedia();
+  file.text().then(function(value) {
+    textarea.value = value.replace(/\n$/, "");
+    updateLineNumbers();
+    updateStats();
+
+    // Infer extension from filename
+    const name = file.name || "";
+    const dot = name.lastIndexOf(".");
+    if (dot > 0) {
+      const ext = name.slice(dot + 1).toLowerCase();
+      ensureExtensionOption(ext);
+      langFilter.value = "";
+      langFilter.dispatchEvent(new Event("input"));
+    }
+
+    // Set title to filename
+    $("title").value = file.name;
+  });
+}
+
+function loadFile(file) {
+  if (isImageFile(file)) {
+    loadMediaFile(file, "image");
+  } else if (isPdfFile(file)) {
+    loadMediaFile(file, "pdf");
+  } else {
+    loadTextFile(file);
+  }
+}
+
+window.addEventListener("paste", function(e) {
+  if (document.activeElement && document.activeElement.tagName === "INPUT") {
+    return;
+  }
+  const items = Array.from(e.clipboardData?.items || []);
+  if (items.some(item => item.kind === "string" && item.type === "text/plain")) {
+    return;
+  }
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].type && items[i].type.startsWith("image/")) {
+      const file = items[i].getAsFile();
+      if (file) {
+        e.preventDefault();
+        loadMediaFile(file, "image");
+        break;
+      }
+    }
+  }
+});
+
 editorWrap.addEventListener("drop", function(e) {
   e.preventDefault();
   dragCounter = 0;
@@ -234,35 +402,10 @@ editorWrap.addEventListener("drop", function(e) {
   }
 });
 
-function loadFile(file) {
-  file.text().then(function(value) {
-    textarea.value = value.replace(/\n$/, "");
-    updateLineNumbers();
-    updateStats();
-
-    // Infer extension from filename
-    const name = file.name || "";
-    const dot = name.lastIndexOf(".");
-    if (dot > 0) {
-      const ext = name.slice(dot + 1).toLowerCase();
-      for (let i = 0; i < langSelect.options.length; i++) {
-        if (langSelect.options[i].value === ext) {
-          langSelect.options[i].selected = true;
-          break;
-        }
-      }
-      langFilter.value = "";
-      langFilter.dispatchEvent(new Event("input"));
-    }
-
-    // Set title to filename
-    $("title").value = file.name;
-  });
-}
-
 $("open").addEventListener("click", function() {
   const input = document.createElement("input");
   input.type = "file";
+  input.accept = "*/*";
   input.onchange = function(e) {
     const file = e.target.files[0];
     if (file) loadFile(file);

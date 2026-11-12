@@ -1,14 +1,39 @@
 use axum::extract::{Path, State};
+use axum::http::header;
 use axum::response::{IntoResponse, Response};
+use axum_extra::headers::HeaderValue;
 
 use crate::cache::Key;
 use crate::handlers::NoStore;
 use crate::handlers::extract::{Password, Theme};
 use crate::handlers::html::{ErrorResponse, FormAction, PasswordInput, make_error};
 use crate::i18n::Lang;
+use crate::media::detect_mime;
 use crate::{Database, Page};
 use wastebin_core::db;
-use wastebin_core::db::read::Entry;
+use wastebin_core::db::read::{Data, Entry};
+
+fn raw_response(key: &Key, data: Data) -> Response {
+    let ext = key.ext.as_deref().or(data.metadata.extension.as_deref());
+    let mime = detect_mime(&data.bytes, ext);
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(mime)
+                    .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+            ),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                HeaderValue::from_static(
+                    "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox",
+                ),
+            ),
+        ],
+        data.bytes,
+    )
+        .into_response()
+}
 
 /// GET handler for raw content of a paste.
 pub async fn get(
@@ -24,8 +49,8 @@ pub async fn get(
         let key: Key = id.parse()?;
 
         match db.get(key.id, password).await {
-            Ok(Entry::Regular(data) | Entry::Burned(data)) => Ok(data.text.into_response()),
-            Ok(Entry::Encrypted(data)) => Ok(data.text.into_response().no_store()),
+            Ok(Entry::Regular(data) | Entry::Burned(data)) => Ok(raw_response(&key, data)),
+            Ok(Entry::Encrypted(data)) => Ok(raw_response(&key, data).no_store()),
             Err(db::Error::NoPassword) => Ok(PasswordInput {
                 page: page.clone(),
                 theme: theme.clone(),
@@ -94,6 +119,57 @@ mod tests {
         let res = client.get(&format!("/raw{location}")).send().await?;
         assert_eq!(res.status(), StatusCode::OK);
         assert!(res.headers().get(header::CACHE_CONTROL).is_none());
+        assert_eq!(
+            res.headers().get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn raw_image_and_pdf() -> Result<(), Box<dyn std::error::Error>> {
+        let client = Client::new(StoreCookies(false)).await;
+
+        let img_entry = Entry {
+            text: String::from("data:image/png;base64,iVBORw0KGgo="),
+            title: String::from("photo.png"),
+            ..Default::default()
+        };
+        let res = client.post_form().form(&img_entry).send().await?;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let loc = res.headers().get("location").unwrap().to_str()?.to_owned();
+
+        let res = client.get(&format!("/raw{loc}")).send().await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(header::CONTENT_TYPE).unwrap().to_str()?,
+            "image/png"
+        );
+        assert_eq!(
+            res.headers().get(header::CONTENT_SECURITY_POLICY).unwrap(),
+            "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox"
+        );
+        let body = res.bytes().await?;
+        assert!(!body.is_empty());
+
+        let pdf_entry = Entry {
+            text: String::from("data:application/pdf;base64,JVBERi0xLjQ="),
+            title: String::from("doc.pdf"),
+            ..Default::default()
+        };
+        let res = client.post_form().form(&pdf_entry).send().await?;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let loc = res.headers().get("location").unwrap().to_str()?.to_owned();
+
+        let res = client.get(&format!("/raw{loc}")).send().await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(header::CONTENT_TYPE).unwrap().to_str()?,
+            "application/pdf"
+        );
+        let body = res.bytes().await?;
+        assert!(body.starts_with(b"%PDF-"));
 
         Ok(())
     }

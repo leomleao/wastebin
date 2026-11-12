@@ -68,20 +68,28 @@ function showToast(text, timeout) {
 
 function copy() {
   const code = document.querySelector('.src-code code');
-  if (!code) return;
-  // Every row is a block element holding one line without its terminator.
-  // `textContent` drops the breaks between block elements along with it, so
-  // join the rows by hand.
-  const content = Array.from(code.querySelectorAll('[id^="LC"]'), row => row.textContent)
-    .join('\n')
-    .trim();
+  if (code) {
+    // Every row is a block element holding one line without its terminator.
+    // `textContent` drops the breaks between block elements along with it, so
+    // join the rows by hand.
+    const content = Array.from(code.querySelectorAll('[id^="LC"]'), row => row.textContent)
+      .join('\n')
+      .trim();
 
-  navigator.clipboard.writeText(content)
-    .then(() => {
-      showToast(TOAST_CONTENT, 1500);
-    }, function(err) {
-      console.error("failed to copy content", err);
-    });
+    navigator.clipboard.writeText(content)
+      .then(() => {
+        showToast(TOAST_CONTENT, 1500);
+      }, function(err) {
+        console.error("failed to copy content", err);
+      });
+  } else {
+    navigator.clipboard.writeText(window.location.href)
+      .then(() => {
+        showToast(TOAST_URL, 1500);
+      }, function(err) {
+        console.error("failed to copy url", err);
+      });
+  }
 }
 
 function onKey(e) {

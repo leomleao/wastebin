@@ -37,10 +37,11 @@ impl From<Entry> for write::Entry {
     fn from(entry: Entry) -> Self {
         // Turn Some("") into None.
         let password = entry.password.and_then(|s| (!s.is_empty()).then_some(s));
+        let extension = entry.extension.filter(|s| !s.is_empty());
 
         Self {
             text: entry.text,
-            extension: entry.extension,
+            extension,
             expires: entry.expires,
             burn_after_reading: entry.burn_after_reading,
             uid: None,

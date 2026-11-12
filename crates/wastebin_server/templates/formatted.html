@@ -9,9 +9,45 @@
 {% endblock %}
 
 {% block content %}
-  <div class="source-view">
-    {{ html|safe }}
-  </div>
+  {% if is_image %}
+    <div class="media-container image-container">
+      <div class="media-toolbar">
+        <span class="media-info">{{ mime_type }} &bull; {{ file_size_formatted }}</span>
+        <div class="media-actions">
+          {% if can_open_raw %}
+          <a href="{{ raw_url }}" target="_blank" class="media-action-btn" title="Open full image in new tab">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+            Open in new tab
+          </a>
+          {% endif %}
+        </div>
+      </div>
+      <div class="image-view-wrapper">
+        <img src="{{ raw_url }}" alt="{% if let Some(title) = title %}{{ title }}{% else %}Shared Image{% endif %}" class="paste-image" id="paste-image" />
+      </div>
+    </div>
+  {% else if is_pdf %}
+    <div class="media-container pdf-container">
+      <div class="media-toolbar">
+        <span class="media-info">PDF Document &bull; {{ file_size_formatted }}</span>
+        <div class="media-actions">
+          {% if can_open_raw %}
+          <a href="{{ raw_url }}" target="_blank" class="media-action-btn" title="Open PDF in new tab">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+            Open in new tab
+          </a>
+          {% endif %}
+        </div>
+      </div>
+      <div class="pdf-view-wrapper">
+        <iframe src="{{ raw_url }}#toolbar=1" class="pdf-iframe" title="{% if let Some(title) = title %}{{ title }}{% else %}PDF Document{% endif %}"></iframe>
+      </div>
+    </div>
+  {% else %}
+    <div class="source-view">
+      {{ html|safe }}
+    </div>
+  {% endif %}
   {% if !is_available %}
   <div id="burn-message" hidden data-message="{{ lang.t("paste.toast.burned") }}"></div>
   <script defer src="{{ page.assets.burn_js.route()}}"></script>

@@ -90,7 +90,11 @@ pub async fn get<E>(
             Err(err) => return Err(err.into()),
         };
 
-        let Data { text, metadata } = data;
+        let Data {
+            text,
+            metadata,
+            ..
+        } = data;
         let Metadata {
             uid: owner_uid,
             title,

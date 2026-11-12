@@ -11,6 +11,7 @@ use crate::handlers::NoStore;
 use crate::handlers::extract::{Password, Theme};
 use crate::handlers::html::{ErrorResponse, FormAction, PasswordInput, make_error};
 use crate::i18n::Lang;
+use crate::media::detect_mime;
 use wastebin_core::db::read::{Data, Entry};
 use wastebin_core::db::{self, Database};
 
@@ -62,17 +63,29 @@ fn make_content_disposition(filename: &str) -> HeaderValue {
 }
 
 fn get_download(key: &Key, data: Data) -> impl IntoResponse {
-    let filename = data.metadata.title.unwrap_or_else(|| key.to_string());
+    let ext = key.ext.as_deref().or(data.metadata.extension.as_deref());
+    let mime = detect_mime(&data.bytes, ext);
+    let mut filename = data.metadata.title.unwrap_or_else(|| key.to_string());
 
-    let content_type = "text; charset=utf-8";
+    if !filename.contains('.') {
+        if let Some(ext) = ext {
+            filename.push('.');
+            filename.push_str(ext);
+        }
+    }
+
     let content_disposition = make_content_disposition(&filename);
 
     (
         [
-            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(mime)
+                    .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+            ),
             (header::CONTENT_DISPOSITION, content_disposition),
         ],
-        data.text,
+        data.bytes,
     )
 }
 
@@ -187,6 +200,51 @@ mod tests {
         let cache_control = res.headers().get(header::CACHE_CONTROL).cloned();
         assert_eq!(res.text().await?, "secret-body-xyz");
         assert_eq!(cache_control.unwrap(), "no-store");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_image_and_pdf() -> Result<(), Box<dyn std::error::Error>> {
+        let client = Client::new(StoreCookies(false)).await;
+
+        // Image upload
+        let img_entry = Entry {
+            text: String::from("data:image/png;base64,iVBORw0KGgo="),
+            title: String::from("photo"),
+            ..Default::default()
+        };
+        let res = client.post_form().form(&img_entry).send().await?;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let loc = res.headers().get("location").unwrap().to_str()?.to_owned();
+        assert!(loc.ends_with(".png"));
+
+        let res = client.get(&format!("/dl{loc}")).send().await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(header::CONTENT_TYPE).unwrap().to_str()?,
+            "image/png"
+        );
+        let content_disposition = res.headers().get(header::CONTENT_DISPOSITION).unwrap();
+        assert!(content_disposition.to_str()?.contains("photo.png"));
+
+        // PDF upload
+        let pdf_entry = Entry {
+            text: String::from("data:application/pdf;base64,JVBERi0xLjQ="),
+            title: String::from("paper.pdf"),
+            ..Default::default()
+        };
+        let res = client.post_form().form(&pdf_entry).send().await?;
+        assert_eq!(res.status(), StatusCode::SEE_OTHER);
+        let loc = res.headers().get("location").unwrap().to_str()?.to_owned();
+        assert!(loc.ends_with(".pdf"));
+
+        let res = client.get(&format!("/dl{loc}")).send().await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers().get(header::CONTENT_TYPE).unwrap().to_str()?,
+            "application/pdf"
+        );
 
         Ok(())
     }

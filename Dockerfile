@@ -1,71 +1,48 @@
-# Cross-compile Dockerfile supporting both x86_64-unknown-linux-musl and
-# aarch64-unknown-linux-musl targets using zig to link against musl libc. Note
-# that this is to be used from an x86_64 host.
+# Multi-stage Dockerfile for Wastebin customized fork (stash.home)
 
-# --- build image
-
-FROM rust:1.95 AS builder
-
-RUN rustup target add \
-    aarch64-unknown-linux-musl \
-    x86_64-unknown-linux-musl
-
-RUN update-ca-certificates
-
-ENV ZIGVERSION=0.15.2
-
-RUN ARCH=$(uname -m) && \
-    if [ "$ARCH" = "aarch64" ]; then ZIGARCH="aarch64"; else ZIGARCH="x86_64"; fi && \
-    wget https://ziglang.org/download/$ZIGVERSION/zig-$ZIGARCH-linux-$ZIGVERSION.tar.xz && \
-    tar -C /usr/local --strip-components=1 -xf zig-$ZIGARCH-linux-$ZIGVERSION.tar.xz && \
-    mv /usr/local/zig /usr/local/bin && \
-    rm zig-$ZIGARCH-linux-$ZIGVERSION.tar.xz
-
-RUN cargo install --locked cargo-zigbuild
+# --- build stage
+FROM rust:1.95-bookworm AS builder
 
 WORKDIR /app
 
-COPY . .
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN cargo zigbuild \
-    --release \
-    --target aarch64-unknown-linux-musl \
-    --target x86_64-unknown-linux-musl \
-    --bin wastebin \
-    --bin wastebin-ctl
+COPY Cargo.toml Cargo.lock ./
+COPY assets ./assets
+COPY crates ./crates
 
-RUN adduser \
-    --disabled-password \
-    --gecos "" \
-    --home "/nonexistent" \
-    --shell "/sbin/nologin" \
-    --no-create-home \
-    --uid "10001" \
-    "app"
+RUN cargo build --release --bin wastebin --bin wastebin-ctl
 
+RUN addgroup --gid 10001 app && adduser --disabled-password --gecos "" --home "/nonexistent" --shell "/sbin/nologin" --no-create-home --uid 10001 --ingroup app app
 
-# --- x86_64-unknown-linux-musl final image
+# --- runtime stage
+FROM debian:bookworm-slim AS runtime
 
-FROM scratch AS amd64
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /etc/passwd /etc/passwd
 COPY --from=builder /etc/group /etc/group
 
 WORKDIR /app
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/wastebin ./
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/wastebin-ctl ./
+COPY --from=builder /app/target/release/wastebin /app/wastebin
+COPY --from=builder /app/target/release/wastebin-ctl /app/wastebin-ctl
+
+RUN mkdir -p /app/data && chown -R app:app /app
+
 USER app:app
-CMD ["/app/wastebin"]
 
-# --- aarch64-unknown-linux-musl final image
+ENV WASTEBIN_ADDRESS_PORT=0.0.0.0:8088 \
+    WASTEBIN_DATABASE_PATH=/app/data/wastebin.db \
+    WASTEBIN_MAX_BODY_SIZE=16777216
 
-FROM scratch AS arm64
+EXPOSE 8088
 
-COPY --from=builder /etc/passwd /etc/passwd
-COPY --from=builder /etc/group /etc/group
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD curl -fsS http://127.0.0.1:8088/ || exit 1
 
-WORKDIR /app
-COPY --from=builder /app/target/aarch64-unknown-linux-musl/release/wastebin ./
-COPY --from=builder /app/target/aarch64-unknown-linux-musl/release/wastebin-ctl ./
-USER app:app
 CMD ["/app/wastebin"]

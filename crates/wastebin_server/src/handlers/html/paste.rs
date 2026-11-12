@@ -53,6 +53,12 @@ pub(crate) struct Paste {
     title: Option<String>,
     /// Whether the paste's extension identifies it as Markdown, enabling the rendered-view toggle.
     is_markdown: bool,
+    is_image: bool,
+    is_pdf: bool,
+    raw_url: String,
+    mime_type: String,
+    file_size_formatted: String,
+    can_open_raw: bool,
 }
 
 /// Return `true` if `ext` identifies a Markdown paste.
@@ -132,7 +138,11 @@ pub async fn get<E>(
             Err(err) => return Err(err.into()),
         };
 
-        let Data { text, metadata } = data;
+        let Data {
+            text,
+            bytes,
+            metadata,
+        } = data;
         let Metadata {
             uid: owner_uid,
             title,
@@ -145,11 +155,29 @@ pub async fn get<E>(
             _ => false,
         };
 
-        let html = if let Some(html) = cache.get(&key, Mode::Source) {
+        let ext = key.ext.as_deref().or(metadata.extension.as_deref());
+        let is_image = crate::media::is_image(&bytes, ext);
+        let is_pdf = crate::media::is_pdf(&bytes, ext);
+        let mime_type = crate::media::detect_mime(&bytes, ext).to_string();
+        let file_size_formatted = crate::media::format_size(bytes.len());
+        let raw_url = if (is_image || is_pdf) && (!is_available || encrypted) {
+            use base64::Engine;
+            format!(
+                "data:{mime_type};base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            )
+        } else {
+            format!("/raw/{key}")
+        };
+        let can_open_raw = is_available && !encrypted && !raw_url.starts_with("data:");
+
+        let html = if is_image || is_pdf {
+            String::new()
+        } else if let Some(html) = cache.get(&key, Mode::Source) {
             tracing::trace!(?key, "found cached item");
             html.into_inner()
         } else {
-            let ext = key.ext.clone();
+            let ext = key.ext.clone().or_else(|| metadata.extension.clone());
             let highlighter = highlighter.clone();
             let html =
                 tokio::task::spawn_blocking(move || highlighter.highlight(text, ext)).await??;
@@ -162,7 +190,7 @@ pub async fn get<E>(
             html.into_inner()
         };
 
-        let is_markdown = is_markdown_ext(key.ext.as_deref());
+        let is_markdown = is_markdown_ext(ext);
         let paste = Paste {
             page: page.clone(),
             key,
@@ -174,6 +202,12 @@ pub async fn get<E>(
             html,
             title,
             is_markdown,
+            is_image,
+            is_pdf,
+            raw_url,
+            mime_type,
+            file_size_formatted,
+            can_open_raw,
         };
 
         let response = paste.into_response();
@@ -261,6 +295,129 @@ mod tests {
         let body = res.text().await?;
         assert!(body.contains("secret-body-xyz"), "body: {body}");
         assert_eq!(cache_control.unwrap(), "no-store");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paste_renders_image_and_pdf() -> Result<(), Box<dyn std::error::Error>> {
+        let client = Client::new(StoreCookies(false)).await;
+
+        let img_entry = crate::handlers::insert::form::Entry {
+            text: String::from("data:image/png;base64,iVBORw0KGgo="),
+            title: String::from("My Screenshot"),
+            ..Default::default()
+        };
+        let res = client.post_form().form(&img_entry).send().await?;
+        let loc = res.headers().get("location").unwrap().to_str()?.to_owned();
+
+        let html = client.get(&loc).send().await?.text().await?;
+        assert!(html.contains("paste-image"), "Expected paste-image in html: {html}");
+        assert!(html.contains("image-container"), "Expected image-container in html: {html}");
+        assert!(html.contains("Open in new tab"), "Expected Open in new tab for available media");
+
+        let pdf_entry = crate::handlers::insert::form::Entry {
+            text: String::from("data:application/pdf;base64,JVBERi0xLjQ="),
+            title: String::from("My Document"),
+            ..Default::default()
+        };
+        let res = client.post_form().form(&pdf_entry).send().await?;
+        let loc = res.headers().get("location").unwrap().to_str()?.to_owned();
+
+        let html = client.get(&loc).send().await?.text().await?;
+        assert!(html.contains("pdf-iframe"), "Expected pdf-iframe in html: {html}");
+        assert!(html.contains("pdf-container"), "Expected pdf-container in html: {html}");
+        assert!(html.contains("Open in new tab"), "Expected Open in new tab for available media");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn burned_and_encrypted_media_renders_inline() -> Result<(), Box<dyn std::error::Error>> {
+        let client = Client::new(StoreCookies(false)).await;
+
+        // Burn-after-reading image
+        let burn_img = crate::handlers::insert::form::Entry {
+            text: String::from("data:image/png;base64,iVBORw0KGgo="),
+            burn_after_reading: Some(String::from("on")),
+            ..Default::default()
+        };
+        let res = client.post_form().form(&burn_img).send().await?;
+        let loc = res.headers().get("location").unwrap().to_str()?.to_owned();
+        let paste_path = loc.strip_prefix("/burn").unwrap();
+
+        // Confirm burn
+        let res = client
+            .post(paste_path)
+            .form(&[("confirm_burn", "1")])
+            .header(reqwest::header::ACCEPT, "text/html; charset=utf-8")
+            .send()
+            .await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let html = res.text().await?;
+        assert!(html.contains("paste-image"), "Expected paste-image in html: {html}");
+        assert!(
+            html.contains("src=\"data:image/png;base64,iVBORw0KGgo=\""),
+            "Expected data URI for burned image in html: {html}"
+        );
+        assert!(
+            !html.contains("Open in new tab"),
+            "Expected no Open in new tab link when can_open_raw is false"
+        );
+
+        // Burn-after-reading PDF
+        let burn_pdf = crate::handlers::insert::form::Entry {
+            text: String::from("data:application/pdf;base64,JVBERi0xLjQ="),
+            burn_after_reading: Some(String::from("on")),
+            ..Default::default()
+        };
+        let res = client.post_form().form(&burn_pdf).send().await?;
+        let loc = res.headers().get("location").unwrap().to_str()?.to_owned();
+        let paste_path = loc.strip_prefix("/burn").unwrap();
+
+        let res = client
+            .post(paste_path)
+            .form(&[("confirm_burn", "1")])
+            .header(reqwest::header::ACCEPT, "text/html; charset=utf-8")
+            .send()
+            .await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let html = res.text().await?;
+        assert!(html.contains("pdf-iframe"), "Expected pdf-iframe in html: {html}");
+        assert!(
+            html.contains("src=\"data:application/pdf;base64,JVBERi0xLjQ=#toolbar=1\""),
+            "Expected data URI for burned pdf in html: {html}"
+        );
+        assert!(
+            !html.contains("Open in new tab"),
+            "Expected no Open in new tab link when can_open_raw is false"
+        );
+
+        // Encrypted image
+        let enc_img = crate::handlers::insert::form::Entry {
+            text: String::from("data:image/png;base64,iVBORw0KGgo="),
+            password: String::from("hunter2"),
+            ..Default::default()
+        };
+        let res = client.post_form().form(&enc_img).send().await?;
+        let loc = res.headers().get("location").unwrap().to_str()?.to_owned();
+
+        let res = client
+            .post(&loc)
+            .form(&[("password", "hunter2")])
+            .header(reqwest::header::ACCEPT, "text/html; charset=utf-8")
+            .send()
+            .await?;
+        let html = res.text().await?;
+        assert!(html.contains("paste-image"), "Expected paste-image in html: {html}");
+        assert!(
+            html.contains("src=\"data:image/png;base64,iVBORw0KGgo=\""),
+            "Expected data URI for encrypted image in html: {html}"
+        );
+        assert!(
+            !html.contains("Open in new tab"),
+            "Expected no Open in new tab link when can_open_raw is false"
+        );
 
         Ok(())
     }
