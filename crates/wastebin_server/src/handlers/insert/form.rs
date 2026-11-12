@@ -42,6 +42,7 @@ impl From<Entry> for write::Entry {
             uid: None,
             password,
             title,
+            ..Default::default()
         }
     }
 }

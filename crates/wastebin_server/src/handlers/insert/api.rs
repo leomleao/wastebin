@@ -47,6 +47,7 @@ impl From<Entry> for write::Entry {
             uid: None,
             password,
             title: entry.title,
+            ..Default::default()
         }
     }
 }

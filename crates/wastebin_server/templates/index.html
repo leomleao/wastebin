@@ -6,184 +6,220 @@
 {% endblock %}
 
 {% block body %}
-<form id="form" action="/new" method="post">
-  <div id="main-container">
-    <header>
-      <div class="nav-group">
-        <a href="/" class="nav-button" title="{{ lang.t("nav.home") }}" aria-label="{{ lang.t("nav.home") }}">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg>
-        </a>
+<div id="main-container" data-max-bytes="{{ page.max_body_size }}" data-unit-kb="{{ lang.t("stats.unit.kb") }}" data-unit-mb="{{ lang.t("stats.unit.mb") }}">
+  <header class="stash-header">
+    <div class="nav-group nav-group-left">
+      <a href="/" id="btn-home" class="nav-button" title="{{ lang.t("nav.home") }}" aria-label="{{ lang.t("nav.home") }}">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><path d="M9 22V12h6v10"/></svg>
+      </a>
+      <button type="button" id="btn-new" class="nav-btn-pill nav-btn-new" title="New blank pad">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        <span>New</span>
+      </button>
+      <div class="recent-switcher" id="recent-dropdown">
+        <select id="recent-select" class="recent-select" title="Recent active pads" aria-label="Recent active pads">
+          <option value="">Recent Pads…</option>
+        </select>
       </div>
-      <div class="nav-group">
-        <button type="button" id="open" class="nav-button" title="{{ lang.t("nav.upload") }}" aria-label="{{ lang.t("nav.upload") }}">
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg>
+    </div>
+
+    <div class="nav-group nav-group-right">
+      <div id="sync-status" class="sync-badge" data-state="ready" title="Real-time sync status">
+        <span class="sync-dot" id="sync-dot"></span>
+        <span id="sync-text">Ready</span>
+      </div>
+
+      <button type="button" id="lang-pill" class="lang-pill" title="Click to toggle Visual/Code Editor &amp; Markdown Preview">
+        Document
+      </button>
+
+      <button type="button" id="btn-copy" class="nav-btn-pill" title="{{ lang.t("nav.copy") }} (Rich HTML + Text for Word/Docs)">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+        <span>Copy</span>
+      </button>
+
+      <button type="button" id="btn-copy-md" class="nav-btn-pill" title="Copy document as clean Markdown">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+        <span>Copy MD</span>
+      </button>
+
+      <button type="button" id="open" class="nav-button" title="{{ lang.t("nav.upload") }} (Insert Image, PDF, or File inline)" aria-label="{{ lang.t("nav.upload") }}">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg>
+      </button>
+      <input type="file" id="file-input" class="hidden" multiple accept="*/*">
+
+      <div class="settings-wrap">
+        <button type="button" id="btn-settings" class="nav-button" title="Settings &amp; Pad Actions" aria-label="Settings" aria-expanded="false">
+          <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         </button>
-        <div class="theme-switcher">
-          {% match theme %}
-            {% when None %}
-              <a href="/theme?pref=dark" class="theme-opt" title="{{ lang.t("theme.dark") }}">
-                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
-              </a>
-              <a href="/theme?pref=light" class="theme-opt" title="{{ lang.t("theme.light") }}">
-                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
-              </a>
-              <a href="/theme?pref=system" class="theme-opt active" title="{{ lang.t("theme.auto") }}">
-                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
-              </a>
-            {% when Some with (Theme::System) %}
-              <a href="/theme?pref=dark" class="theme-opt" title="{{ lang.t("theme.dark") }}">
-                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
-              </a>
-              <a href="/theme?pref=light" class="theme-opt" title="{{ lang.t("theme.light") }}">
-                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
-              </a>
-              <a href="/theme?pref=system" class="theme-opt active" title="{{ lang.t("theme.auto") }}">
-                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
-              </a>
-            {% when Some with (Theme::Dark) %}
-              <a href="/theme?pref=dark" class="theme-opt active" title="{{ lang.t("theme.dark") }}">
-                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
-              </a>
-              <a href="/theme?pref=light" class="theme-opt" title="{{ lang.t("theme.light") }}">
-                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
-              </a>
-              <a href="/theme?pref=system" class="theme-opt" title="{{ lang.t("theme.auto") }}">
-                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
-              </a>
-            {% when Some with (Theme::Light) %}
-              <a href="/theme?pref=dark" class="theme-opt" title="{{ lang.t("theme.dark") }}">
-                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
-              </a>
-              <a href="/theme?pref=light" class="theme-opt active" title="{{ lang.t("theme.light") }}">
-                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
-              </a>
-              <a href="/theme?pref=system" class="theme-opt" title="{{ lang.t("theme.auto") }}">
-                <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
-              </a>
-          {% endmatch %}
-        </div>
-      </div>
-    </header>
-    <div id="content-area">
-      <main class="editor-area">
-        <div class="editor" id="editor-wrap">
-          <div id="line-numbers" aria-hidden="true"></div>
-          <textarea id="text" name="text" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" placeholder="{{ lang.t("index.placeholder.paste") }}" autofocus required></textarea>
-          <div id="media-preview" class="media-preview hidden">
-            <div id="preview-image-box" class="preview-image-wrap hidden">
-              <img id="preview-image" class="preview-image" src="" alt="Preview">
-            </div>
-            <div id="preview-pdf-box" class="preview-pdf-card hidden">
-              <svg class="preview-pdf-icon" viewBox="0 0 24 24" width="48" height="48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
-              <div class="preview-filename" id="preview-filename">document.pdf</div>
-              <div class="preview-filesize" id="preview-filesize">0 KB</div>
-            </div>
-            <button type="button" id="media-remove" class="preview-remove-btn" title="Remove attachment">
-              <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-              Remove
-            </button>
-          </div>
-          <div class="drop-overlay" id="drop-overlay">
-            <div>
-              <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg>
-              <div class="drop-overlay-text">{{ lang.t("index.drop") }}</div>
+
+        <div id="settings-popover" class="settings-popover hidden" role="dialog" aria-label="Settings">
+          <div class="popover-section">
+            <div class="panel-label">Default Expiration</div>
+            <div class="expiry-list" id="setting-expires">
+              <label class="expiry-btn">
+                <input type="radio" name="stash_expires" value="86400">
+                <span>24 hours</span>
+              </label>
+              <label class="expiry-btn">
+                <input type="radio" name="stash_expires" value="604800">
+                <span>7 days</span>
+              </label>
+              <label class="expiry-btn">
+                <input type="radio" name="stash_expires" value="2592000" checked>
+                <span>30 days</span>
+              </label>
+              <label class="expiry-btn">
+                <input type="radio" name="stash_expires" value="7776000">
+                <span>90 days</span>
+              </label>
+              <label class="expiry-btn">
+                <input type="radio" name="stash_expires" value="0">
+                <span>Never</span>
+              </label>
             </div>
           </div>
-        </div>
-      </main>
 
-      <aside class="panel">
-        <section class="panel-section">
-          <div class="panel-label">{{ lang.t("index.label.title") }}</div>
-          <input type="text" name="title" id="title" class="input-base" placeholder="{{ lang.t("index.placeholder.title") }}">
-        </section>
-
-        <section class="panel-section">
-          <div class="panel-label">{{ lang.t("index.label.language") }}</div>
-          <input type="search" id="filter" class="input-base lang-filter" placeholder="{{ lang.t("index.placeholder.filter") }}" autocomplete="off">
-          <select name="extension" id="langs" class="lang-select" size="12" aria-label="{{ lang.t("index.aria.language") }}">
-          {%- for syntax in highlighter.syntaxes() -%}
-            {%- if let Some(extension) = syntax.extensions.first() %}
-            <option value="{{ extension }}">{{ syntax.name }}</option>
-            {%- endif -%}
-          {%- endfor %}
-          </select>
-        </section>
-
-        <section class="panel-section">
-          <div class="panel-label">{{ lang.t("index.label.expires") }}</div>
-          <div class="expiry-list" id="expiry-list">
-            {% for expiration in page.expirations %}
-            <label class="expiry-btn">
-              <input type="radio" name="expires" value="{{ expiration.duration.as_secs() }}" {% if expiration.default %}checked{% endif %}>
-              <span>{{ lang.duration(expiration) }}</span>
-            </label>
-            {% endfor %}
+          <div class="popover-section">
+            <div class="panel-label">Syntax / Mode Override</div>
+            <select id="setting-lang" class="input-base" aria-label="{{ lang.t("index.aria.language") }}">
+              <option value="auto" selected>Auto-detect (Smart)</option>
+              <option value="rich">Document (Rich Inline)</option>
+              <option value="js">JavaScript</option>
+              <option value="ts">TypeScript</option>
+              <option value="php">PHP</option>
+              <option value="abap">ABAP</option>
+              <option value="md">Markdown</option>
+              <option value="py">Python</option>
+              <option value="sql">SQL</option>
+              <option value="json">JSON</option>
+              <option value="html">HTML</option>
+              <option value="css">CSS</option>
+              <option value="sh">Bash / Shell</option>
+              <option value="rs">Rust</option>
+              <option value="yaml">YAML</option>
+              <option value="txt">Plain Text</option>
+              <optgroup label="All Syntaxes">
+              {%- for syntax in highlighter.syntaxes() -%}
+                {%- if let Some(extension) = syntax.extensions.first() %}
+                <option value="{{ extension }}">{{ syntax.name }}</option>
+                {%- endif -%}
+              {%- endfor %}
+              </optgroup>
+            </select>
           </div>
-        </section>
 
-        <section class="panel-section">
-          <div class="panel-label">{{ lang.t("index.label.options") }}</div>
-          <label class="toggle-row" id="burn-row">
-            <div>
-              <div class="toggle-label">{{ lang.t("index.toggle.burn") }}</div>
-              <div class="toggle-hint">{{ lang.t("index.toggle.burn.hint") }}</div>
+          <div class="popover-section">
+            <div class="panel-label">Theme</div>
+            <div class="theme-switcher popover-theme-switcher">
+              {% match theme %}
+                {% when None %}
+                  <a href="/theme?pref=dark" class="theme-opt" title="{{ lang.t("theme.dark") }}">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+                    <span>Dark</span>
+                  </a>
+                  <a href="/theme?pref=light" class="theme-opt" title="{{ lang.t("theme.light") }}">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
+                    <span>Light</span>
+                  </a>
+                  <a href="/theme?pref=system" class="theme-opt active" title="{{ lang.t("theme.auto") }}">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
+                    <span>System</span>
+                  </a>
+                {% when Some with (Theme::System) %}
+                  <a href="/theme?pref=dark" class="theme-opt" title="{{ lang.t("theme.dark") }}">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+                    <span>Dark</span>
+                  </a>
+                  <a href="/theme?pref=light" class="theme-opt" title="{{ lang.t("theme.light") }}">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
+                    <span>Light</span>
+                  </a>
+                  <a href="/theme?pref=system" class="theme-opt active" title="{{ lang.t("theme.auto") }}">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
+                    <span>System</span>
+                  </a>
+                {% when Some with (Theme::Dark) %}
+                  <a href="/theme?pref=dark" class="theme-opt active" title="{{ lang.t("theme.dark") }}">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+                    <span>Dark</span>
+                  </a>
+                  <a href="/theme?pref=light" class="theme-opt" title="{{ lang.t("theme.light") }}">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
+                    <span>Light</span>
+                  </a>
+                  <a href="/theme?pref=system" class="theme-opt" title="{{ lang.t("theme.auto") }}">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
+                    <span>System</span>
+                  </a>
+                {% when Some with (Theme::Light) %}
+                  <a href="/theme?pref=dark" class="theme-opt" title="{{ lang.t("theme.dark") }}">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+                    <span>Dark</span>
+                  </a>
+                  <a href="/theme?pref=light" class="theme-opt active" title="{{ lang.t("theme.light") }}">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg>
+                    <span>Light</span>
+                  </a>
+                  <a href="/theme?pref=system" class="theme-opt" title="{{ lang.t("theme.auto") }}">
+                    <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
+                    <span>System</span>
+                  </a>
+              {% endmatch %}
             </div>
-            <span class="toggle-track">
-              <input type="checkbox" name="burn-after-reading" id="burn-after-reading" class="toggle-input">
-              <span class="toggle-switch"></span>
-            </span>
-          </label>
-          <div class="toggle-gap"></div>
-          <label class="toggle-row" id="encrypt-row">
-            <div>
-              <div class="toggle-label">{{ lang.t("index.toggle.encrypt") }}</div>
-              <div class="toggle-hint">{{ lang.t("index.toggle.encrypt.hint") }}</div>
-            </div>
-            <span class="toggle-track">
-              <input type="checkbox" id="encrypt-toggle" class="toggle-input">
-              <span class="toggle-switch"></span>
-            </span>
-          </label>
-          <div class="password-group" id="password-group">
-            <div class="password-input-wrap">
-              <input type="password" name="password" id="password" class="input-base" placeholder="{{ lang.t("index.placeholder.password") }}">
-              <button type="button" id="password-toggle" class="password-toggle" title="{{ lang.t("password.show") }}" aria-label="{{ lang.t("password.show") }}" data-show-label="{{ lang.t("password.show") }}" data-hide-label="{{ lang.t("password.hide") }}">
-                <svg class="eye-show" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>
-                <svg class="eye-hide" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.88 9.88a3 3 0 1 0 4.24 4.24"/><path d="M10.73 5.08A10.43 10.43 0 0 1 12 5c7 0 10 7 10 7a13.16 13.16 0 0 1-1.67 2.68"/><path d="M6.61 6.61A13.526 13.526 0 0 0 2 12s3 7 10 7a9.74 9.74 0 0 0 5.39-1.61"/><path d="m2 2 20 20"/></svg>
+          </div>
+
+          <div class="popover-section popover-actions">
+            <div class="panel-label">Pad Actions</div>
+            <div class="popover-action-row">
+              <a id="btn-download" href="#" class="popover-action-btn" title="{{ lang.t("nav.download") }}">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                <span>Download</span>
+              </a>
+              <a id="btn-raw" href="#" target="_blank" rel="noopener" class="popover-action-btn" title="{{ lang.t("nav.raw") }}">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+                <span>Raw</span>
+              </a>
+              <button type="button" id="btn-delete" class="popover-action-btn popover-action-danger" title="{{ lang.t("nav.delete") }}">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                <span>Delete Pad</span>
               </button>
             </div>
           </div>
-        </section>
 
-        <section class="panel-section panel-footer">
-          <div class="stats" id="stats" data-max-bytes="{{ page.max_body_size }}" data-unit-kb="{{ lang.t("stats.unit.kb") }}" data-unit-mb="{{ lang.t("stats.unit.mb") }}" data-label-limit="{{ lang.t("stats.label.limit") }}">
-            <div class="stats-grid">
-              <div>
-                <div class="stat-label">{{ lang.t("index.stat.lines") }}</div>
-                <div class="stat-value" id="stat-lines">0</div>
-              </div>
-              <div>
-                <div class="stat-label">{{ lang.t("index.stat.chars") }}</div>
-                <div class="stat-value" id="stat-chars">0</div>
-              </div>
-              <div>
-                <div class="stat-label">{{ lang.t("index.stat.bytes") }}</div>
-                <div class="stat-value" id="stat-bytes">0</div>
-              </div>
-            </div>
-            <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
-            <div class="progress-label">
-              <span id="progress-kb">0.0 {{ lang.t("stats.unit.kb") }}</span>
-              <span id="progress-limit"></span>
-            </div>
+          <div class="hidden" aria-hidden="true">
+            {% for expiration in page.expirations %}
+            <span data-secs="{{ expiration.duration.as_secs() }}" data-default="{{ expiration.default }}">{{ lang.duration(expiration) }}</span>
+            {% endfor %}
           </div>
-          <button type="submit" title="{{ lang.t("index.button.paste") }}" class="paste-btn">
-            <span>{{ lang.t("index.button.paste.label") }}</span>
-          </button>
-        </section>
-      </aside>
+        </div>
+      </div>
     </div>
+  </header>
+
+  <div id="content-area">
+    <main class="editor-area">
+      <div class="editor" id="editor-wrap">
+        <div id="visual-editor" class="visual-editor" contenteditable="true" spellcheck="true" role="textbox" aria-multiline="true" data-placeholder="Type notes, paste from .docx / Word / Markdown, paste screenshots (⌘V), or drop PDFs &amp; images inline…"></div>
+
+        <div id="code-editor-wrap" class="code-editor-wrap hidden">
+          <div id="line-numbers" aria-hidden="true"><div>1</div></div>
+          <div class="code-stage">
+            <div id="code-highlight-layer" class="code-highlight-layer src-code" aria-hidden="true"></div>
+            <textarea id="code-textarea" name="text" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" placeholder="{{ lang.t("index.placeholder.paste") }}"></textarea>
+          </div>
+        </div>
+
+        <div id="markdown-preview" class="markdown-body markdown-preview-layer hidden"></div>
+
+        <div class="drop-overlay" id="drop-overlay">
+          <div>
+            <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg>
+            <div class="drop-overlay-text">{{ lang.t("index.drop") }}</div>
+          </div>
+        </div>
+      </div>
+    </main>
   </div>
-</form>
+</div>
 {% endblock %}

@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 use crate::crypto::{self, Password};
 use crate::expiration::Expiration;
 use crate::id::Id;
-use read::{DatabaseEntry, ListEntry, Metadata};
+use read::{DatabaseEntry, ListEntry, Metadata, PadSummary};
 
 /// Database related errors.
 #[derive(thiserror::Error, Debug)]
@@ -54,6 +54,8 @@ struct Handler {
     conn: Connection,
     /// Receiver for database commands.
     receiver: kanal::Receiver<Command>,
+    /// Strictly increasing write sequence for deterministic `updated_at` ordering.
+    write_seq: u64,
 }
 
 /// Commands issued to the database handler and corresponding to [`Database`] calls.
@@ -91,6 +93,18 @@ enum Command {
     },
     Purge {
         result: oneshot::Sender<Result<Vec<Id>, Error>>,
+    },
+    Update {
+        id: Id,
+        entry: write::DatabaseEntry,
+        result: oneshot::Sender<Result<write::Entry, Error>>,
+    },
+    GetLatestPadId {
+        result: oneshot::Sender<Result<Option<Id>, Error>>,
+    },
+    ListRecentPads {
+        limit: usize,
+        result: oneshot::Sender<Result<Vec<PadSummary>, Error>>,
     },
 }
 
@@ -131,6 +145,9 @@ pub mod write {
         pub password: Option<String>,
         /// Title
         pub title: Option<String>,
+        /// Whether this entry is a standalone asset (e.g. inline pasted image) rather than a pad
+        #[serde(default)]
+        pub is_asset: bool,
     }
 
     /// A compressed entry to be inserted.
@@ -327,6 +344,15 @@ pub mod read {
         pub is_expired: bool,
     }
 
+    /// Summary of a recent pad for sidebar / recent pads listing.
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    pub struct PadSummary {
+        pub id: String,
+        pub extension: Option<String>,
+        pub updated_at: Option<String>,
+        pub preview: String,
+    }
+
     impl DatabaseEntry {
         pub async fn decrypt(
             self,
@@ -429,11 +455,29 @@ impl Handler {
             M::up(include_str!("migrations/0006-add-nonce-column.sql")),
             M::up(include_str!("migrations/0007-add-title-column.sql")),
             M::up(include_str!("migrations/0008-add-extension-column.sql")),
+            M::up(include_str!(
+                "migrations/0009-add-updated-at-and-is-asset.sql"
+            )),
         ]);
 
         migrations.to_latest(&mut conn)?;
 
-        Ok(Self { conn, receiver })
+        Ok(Self {
+            conn,
+            receiver,
+            write_seq: 0,
+        })
+    }
+
+    fn next_updated_at(&mut self) -> Result<String, rusqlite::Error> {
+        self.write_seq = self.write_seq.wrapping_add(1);
+        let seq = self.write_seq;
+        let ts: String =
+            self.conn
+                .query_row("SELECT strftime('%Y-%m-%d %H:%M:%f', 'now')", [], |row| {
+                    row.get(0)
+                })?;
+        Ok(format!("{ts}.{seq:010}"))
     }
 
     /// Run database command loop.
@@ -472,6 +516,15 @@ impl Handler {
                 Command::Purge { result } => result
                     .send(self.purge())
                     .map_err(|_| Error::ResultSendError),
+                Command::Update { id, entry, result } => result
+                    .send(self.update(id, entry))
+                    .map_err(|_| Error::ResultSendError),
+                Command::GetLatestPadId { result } => result
+                    .send(self.get_latest_pad_id())
+                    .map_err(|_| Error::ResultSendError),
+                Command::ListRecentPads { limit, result } => result
+                    .send(self.list_recent_pads(limit))
+                    .map_err(|_| Error::ResultSendError),
             };
 
             if let Err(err) = result {
@@ -481,23 +534,34 @@ impl Handler {
     }
 
     fn insert(
-        &self,
+        &mut self,
         write::DatabaseEntry { entry, data, nonce }: write::DatabaseEntry,
     ) -> Result<(Id, write::Entry), Error> {
         let mut counter = 0;
         let title = entry.title.clone();
         let nonce = nonce.as_ref().map(|n| n.as_slice());
+        let updated_at = self.next_updated_at()?;
 
         loop {
             let id = Id::rand();
 
             let result = match entry.expires {
                 None => self.conn.execute(
-                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, title, extension) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![id.to_i64(), entry.uid, data, entry.burn_after_reading, nonce, title, entry.extension],
+                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, title, extension, is_asset, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        id.to_i64(),
+                        entry.uid,
+                        data,
+                        entry.burn_after_reading,
+                        nonce,
+                        title,
+                        entry.extension,
+                        entry.is_asset,
+                        &updated_at,
+                    ],
                 ),
                 Some(expires) => self.conn.execute(
-                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, expires, title, extension) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', ?6), ?7, ?8)",
+                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, expires, title, extension, is_asset, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', ?6), ?7, ?8, ?9, ?10)",
                     params![
                         id.to_i64(),
                         entry.uid,
@@ -507,6 +571,8 @@ impl Handler {
                         format!("{expires} seconds"),
                         title,
                         entry.extension,
+                        entry.is_asset,
+                        &updated_at,
                     ],
                 ),
             };
@@ -667,6 +733,159 @@ impl Handler {
 
         Ok(ids)
     }
+
+    fn update(
+        &mut self,
+        id: Id,
+        write::DatabaseEntry { entry, data, nonce }: write::DatabaseEntry,
+    ) -> Result<write::Entry, Error> {
+        let title = entry.title.clone();
+        let nonce_slice = nonce.as_ref().map(|n| n.as_slice());
+        let updated_at = self.next_updated_at()?;
+
+        let affected = match entry.expires {
+            None => self.conn.execute(
+                "UPDATE entries SET data = ?2, extension = ?3, title = ?4, is_asset = ?5, updated_at = ?6, expires = NULL WHERE id = ?1",
+                params![id.to_i64(), data, entry.extension, title, entry.is_asset, &updated_at],
+            )?,
+            Some(expires) => self.conn.execute(
+                "UPDATE entries SET data = ?2, extension = ?3, title = ?4, is_asset = ?5, updated_at = ?6, expires = datetime('now', ?7) WHERE id = ?1",
+                params![
+                    id.to_i64(),
+                    data,
+                    entry.extension,
+                    title,
+                    entry.is_asset,
+                    &updated_at,
+                    format!("{expires} seconds"),
+                ],
+            )?,
+        };
+
+        if affected == 0 {
+            match entry.expires {
+                None => self.conn.execute(
+                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, title, extension, is_asset, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        id.to_i64(),
+                        entry.uid,
+                        data,
+                        entry.burn_after_reading,
+                        nonce_slice,
+                        title,
+                        entry.extension,
+                        entry.is_asset,
+                        &updated_at,
+                    ],
+                )?,
+                Some(expires) => self.conn.execute(
+                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, expires, title, extension, is_asset, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', ?6), ?7, ?8, ?9, ?10)",
+                    params![
+                        id.to_i64(),
+                        entry.uid,
+                        data,
+                        entry.burn_after_reading,
+                        nonce_slice,
+                        format!("{expires} seconds"),
+                        title,
+                        entry.extension,
+                        entry.is_asset,
+                        &updated_at,
+                    ],
+                )?,
+            };
+        }
+
+        Ok(entry)
+    }
+
+    fn get_latest_pad_id(&self) -> Result<Option<Id>, Error> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM entries WHERE (expires IS NULL OR expires > datetime('now')) AND IFNULL(is_asset, 0) = 0 AND IFNULL(burn_after_reading, 0) = 0 AND nonce IS NULL ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let raw_id: i64 = row.get(0)?;
+            Ok(Some(Id::from(raw_id)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn list_recent_pads(&self, limit: usize) -> Result<Vec<PadSummary>, Error> {
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, data, extension, updated_at, title FROM entries WHERE (expires IS NULL OR expires > datetime('now')) AND IFNULL(is_asset, 0) = 0 AND IFNULL(burn_after_reading, 0) = 0 AND nonce IS NULL ORDER BY updated_at DESC, rowid DESC LIMIT ?1",
+        )?;
+
+        let pads = stmt
+            .query_map(params![limit_i64], |row| {
+                let raw_id: i64 = row.get(0)?;
+                let data: Vec<u8> = row.get(1)?;
+                let extension: Option<String> = row.get(2)?;
+                let updated_at: Option<String> = row.get(3)?;
+                let title: Option<String> = row.get(4)?;
+
+                let preview = Self::extract_preview(&data, title.as_deref());
+
+                Ok(PadSummary {
+                    id: Id::from(raw_id).to_string(),
+                    extension,
+                    updated_at,
+                    preview,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(pads)
+    }
+
+    fn extract_preview(data: &[u8], title: Option<&str>) -> String {
+        if let Ok(decoded) = zstd::stream::decode_all(Cursor::new(data))
+            && let Ok(text) = std::str::from_utf8(&decoded)
+        {
+            let mut stripped = String::with_capacity(text.len().min(256));
+            let mut in_tag = false;
+            for ch in text.chars() {
+                match ch {
+                    '<' => {
+                        in_tag = true;
+                        stripped.push(' ');
+                    }
+                    '>' => {
+                        in_tag = false;
+                        stripped.push(' ');
+                    }
+                    _ if !in_tag => stripped.push(ch),
+                    _ => {}
+                }
+                if stripped.len() >= 512 {
+                    break;
+                }
+            }
+            let stripped = stripped
+                .replace("&nbsp;", " ")
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'");
+            let single_line: String = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !single_line.is_empty() {
+                let mut preview: String = single_line.chars().take(48).collect();
+                if single_line.chars().count() > 48 {
+                    preview.push('…');
+                }
+                return preview;
+            }
+        }
+
+        if let Some(t) = title.map(str::trim).filter(|t| !t.is_empty()) {
+            return t.chars().take(48).collect();
+        }
+
+        "Untitled pad".to_string()
+    }
 }
 
 impl Database {
@@ -755,7 +974,7 @@ impl Database {
     }
 
     /// Delete paste with `id`. Returns whether the entry was still present.
-    async fn delete(&self, id: Id) -> Result<bool, Error> {
+    pub async fn delete(&self, id: Id) -> Result<bool, Error> {
         let (result, command_result) = oneshot::channel();
         self.sender
             .send(Command::Delete { id, result })
@@ -813,6 +1032,52 @@ impl Database {
         let (result, command_result) = oneshot::channel();
         self.sender
             .send(Command::Purge { result })
+            .await
+            .map_err(|_| Error::SendError)?;
+        command_result.await?
+    }
+
+    /// Update (or upsert if not found) `entry` under `id` in the database.
+    pub async fn update(&self, id: Id, entry: write::Entry) -> Result<write::Entry, Error> {
+        let entry = entry.compress().await?.encrypt().await?;
+
+        let (result, command_result) = oneshot::channel();
+        self.sender
+            .send(Command::Update { id, entry, result })
+            .await
+            .map_err(|_| Error::SendError)?;
+
+        command_result.await?
+    }
+
+    /// Retrieve the most recently updated non-expired, non-asset, non-encrypted, non-burn pad.
+    pub async fn get_latest_pad(&self) -> Result<Option<(Id, read::Data)>, Error> {
+        let (result, command_result) = oneshot::channel();
+        self.sender
+            .send(Command::GetLatestPadId { result })
+            .await
+            .map_err(|_| Error::SendError)?;
+
+        let Some(id) = command_result.await?? else {
+            return Ok(None);
+        };
+
+        match self.get(id, None).await {
+            Ok(
+                read::Entry::Regular(data)
+                | read::Entry::Burned(data)
+                | read::Entry::Encrypted(data),
+            ) => Ok(Some((id, data))),
+            Err(Error::NotFound) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// List recent non-expired, non-asset, non-encrypted, non-burn pads ordered by most recently updated.
+    pub async fn list_recent_pads(&self, limit: usize) -> Result<Vec<read::PadSummary>, Error> {
+        let (result, command_result) = oneshot::channel();
+        self.sender
+            .send(Command::ListRecentPads { limit, result })
             .await
             .map_err(|_| Error::SendError)?;
         command_result.await?
@@ -1112,6 +1377,88 @@ mod tests {
 
         let data = db.get(id, None).await?.unwrap_inner();
         assert_eq!(data.bytes, vec![1, 2, 3, 4, 5]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_and_upsert() -> Result<(), Box<dyn std::error::Error>> {
+        let db = new_db()?;
+
+        // Upsert on non-existent ID
+        let id = Id::from(12345u32);
+        let entry = write::Entry {
+            text: "initial content".to_string(),
+            extension: Some("md".to_string()),
+            title: Some("First Title".to_string()),
+            ..Default::default()
+        };
+        db.update(id, entry).await?;
+
+        let fetched = db.get(id, None).await?.unwrap_inner();
+        assert_eq!(fetched.text, "initial content");
+        assert_eq!(fetched.metadata.extension.as_deref(), Some("md"));
+        assert_eq!(fetched.metadata.title.as_deref(), Some("First Title"));
+
+        // Update existing ID
+        let updated_entry = write::Entry {
+            text: "updated content".to_string(),
+            extension: Some("html".to_string()),
+            title: Some("Updated Title".to_string()),
+            expires: Some(NonZeroU32::new(3600).unwrap()),
+            ..Default::default()
+        };
+        db.update(id, updated_entry).await?;
+
+        let fetched2 = db.get(id, None).await?.unwrap_inner();
+        assert_eq!(fetched2.text, "updated content");
+        assert_eq!(fetched2.metadata.extension.as_deref(), Some("html"));
+        assert_eq!(fetched2.metadata.title.as_deref(), Some("Updated Title"));
+        assert!(fetched2.metadata.expiration.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn latest_pad_and_recent_pads_ignore_assets() -> Result<(), Box<dyn std::error::Error>> {
+        let db = new_db()?;
+
+        assert!(db.get_latest_pad().await?.is_none());
+
+        let (pad1_id, _) = db
+            .insert(write::Entry {
+                text: "<p>Hello <b>Rich Text</b> World</p>".to_string(),
+                extension: Some("html".to_string()),
+                ..Default::default()
+            })
+            .await?;
+
+        let (pad2_id, _) = db
+            .insert(write::Entry {
+                text: "# Second Pad\nSome markdown here".to_string(),
+                extension: Some("md".to_string()),
+                ..Default::default()
+            })
+            .await?;
+
+        // Insert an asset after pad2 — should be ignored by get_latest_pad and list_recent_pads
+        db.insert(write::Entry {
+            text: "data:image/png;base64,AQIDBAU=".to_string(),
+            is_asset: true,
+            ..Default::default()
+        })
+        .await?;
+
+        let (latest_id, latest_data) = db.get_latest_pad().await?.expect("latest pad exists");
+        assert_eq!(latest_id, pad2_id);
+        assert_eq!(latest_data.text, "# Second Pad\nSome markdown here");
+
+        let recents = db.list_recent_pads(10).await?;
+        assert_eq!(recents.len(), 2);
+        assert_eq!(recents[0].id, pad2_id.to_string());
+        assert_eq!(recents[0].preview, "# Second Pad Some markdown here");
+        assert_eq!(recents[1].id, pad1_id.to_string());
+        assert_eq!(recents[1].preview, "Hello Rich Text World");
 
         Ok(())
     }

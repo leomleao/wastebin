@@ -1,5 +1,6 @@
 mod assets;
 mod cache;
+pub(crate) mod detect;
 mod env;
 mod errors;
 mod handlers;
@@ -34,7 +35,7 @@ use crate::assets::Asset;
 use crate::cache::Cache;
 use crate::errors::Error;
 use crate::handlers::extract::Theme;
-use crate::handlers::{delete, download, html, insert, raw, robots, theme};
+use crate::handlers::{delete, download, html, insert, pad, raw, robots, theme};
 use crate::i18n::Lang;
 use wastebin_core::db::Database;
 
@@ -51,6 +52,13 @@ pub(crate) struct AppState {
     key: Key,
     page: Page,
     highlighter: Highlighter,
+    pad_tx: tokio::sync::broadcast::Sender<String>,
+}
+
+impl FromRef<AppState> for tokio::sync::broadcast::Sender<String> {
+    fn from_ref(state: &AppState) -> Self {
+        state.pad_tx.clone()
+    }
 }
 
 impl FromRef<AppState> for Key {
@@ -86,7 +94,7 @@ impl FromRef<AppState> for Cache {
 async fn security_headers_layer(req: Request, next: Next) -> impl IntoResponse {
     // Rendered Markdown may embed remote images via `![](…)`; relax img-src for that route only.
     const CSP_STRICT: HeaderValue = HeaderValue::from_static(
-        "default-src 'none'; script-src 'self'; img-src 'self' data: ; style-src 'self' data: ; font-src 'self' data: ; object-src 'self' ; frame-src 'self' data: ; base-uri 'none' ; frame-ancestors 'self' ; form-action 'self' ;",
+        "default-src 'none'; connect-src 'self'; script-src 'self'; img-src 'self' data: blob: * ; style-src 'self' 'unsafe-inline' data: ; font-src 'self' data: ; object-src 'self' ; frame-src 'self' data: blob: ; base-uri 'none' ; frame-ancestors 'self' ; form-action 'self' ;",
     );
     const CSP_RENDERED: HeaderValue = HeaderValue::from_static(
         "default-src 'none'; script-src 'self'; img-src * data: ; style-src 'self' data: ; font-src 'self' data: ; object-src 'self' ; frame-src 'self' data: ; base-uri 'none' ; frame-ancestors 'self' ; form-action 'self' ;",
@@ -206,10 +214,24 @@ fn make_app(state: AppState, timeout: Duration, max_body_size: usize) -> Router 
         app = app.route(asset.route(), asset_route(asset));
     }
 
+    let sse_router = Router::new()
+        .route("/api/pad/events", get(pad::sse_events))
+        .layer(from_fn(security_headers_layer))
+        .with_state(state.clone());
+
     app.route("/", get(html::index::get).post(insert::api::post))
         .route("/robots.txt", get(robots::get))
         .route("/theme", get(theme::get))
-        .route("/new", post(insert::form::post))
+        .route("/new", get(html::index::get).post(insert::form::post))
+        .route("/api/pad/latest", get(pad::get_latest))
+        .route("/api/pad", post(pad::create_pad))
+        .route(
+            "/api/pad/{id}",
+            get(pad::get_pad)
+                .put(pad::update_pad)
+                .delete(pad::delete_pad),
+        )
+        .route("/api/asset", post(pad::upload_asset))
         .route("/qr/{id}", get(html::qr::get))
         .route(
             "/md/{id}",
@@ -241,6 +263,7 @@ fn make_app(state: AppState, timeout: Duration, max_body_size: usize) -> Router 
                 .layer(from_fn_with_state(state.clone(), handle_service_errors)),
         )
         .with_state(state)
+        .merge(sse_router)
 }
 
 async fn start() -> Result<(), Box<dyn std::error::Error>> {
@@ -273,12 +296,14 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         max_body_size,
     ));
     let highlighter = Arc::new(wastebin_highlight::Highlighter::default());
+    let (pad_tx, _) = tokio::sync::broadcast::channel(128);
     let state = AppState {
         db,
         cache,
         key,
         page,
         highlighter,
+        pad_tx,
     };
 
     let app = make_app(state, timeout, max_body_size);

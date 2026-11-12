@@ -3,6 +3,7 @@ pub mod download;
 pub mod extract;
 pub mod html;
 pub mod insert;
+pub mod pad;
 pub mod raw;
 pub mod robots;
 pub mod theme;
