@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::num::NonZeroU32;
-use std::time::Duration;
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::body::Bytes;
@@ -23,8 +25,18 @@ use wastebin_core::id::Id;
 /// Number of pads listed by `/api/pads`.
 const RECENT_PADS: usize = 20;
 
-/// Uploads expire after a day unless a saved pad shows them, which makes them expire with it.
-const PENDING_ASSET_EXPIRY: u32 = 86_400;
+/// Uploads that belong to no pad expire after a day. Uploads into a pad are deleted with it.
+const UNOWNED_ASSET_EXPIRY: u32 = 86_400;
+
+/// How long the pad created for a `create_key` is remembered.
+const CREATE_KEY_TTL: Duration = Duration::from_secs(600);
+
+/// Pads created recently, by the `create_key` of the request that created them. An editor that
+/// lost the response to a create retries with the same key and gets the same pad back instead of
+/// a second one. Memory is enough: losing a response right when the server restarts is rare, and
+/// costs no more than a duplicate pad.
+static CREATED: LazyLock<tokio::sync::Mutex<HashMap<String, (Id, Instant)>>> =
+    LazyLock::new(Default::default);
 
 /// Longest pad label kept for the pad list.
 const MAX_PREVIEW_CHARS: usize = 80;
@@ -71,12 +83,18 @@ pub struct PadWriteRequest {
     /// refused with `409 Conflict` and the current pad.
     #[serde(default)]
     pub base_revision: Option<String>,
+    /// On creation, a key the editor keeps for retries of the same create.
+    #[serde(default)]
+    pub create_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct AssetQuery {
     #[serde(default)]
     pub filename: Option<String>,
+    /// Pad the upload belongs to.
+    #[serde(default)]
+    pub pad: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -128,23 +146,6 @@ fn pad_extension(req: &PadWriteRequest) -> Result<String, JsonErrorResponse> {
     } else {
         Err(bad_request(StatusCode::BAD_REQUEST, "invalid extension"))
     }
-}
-
-/// Ids of the uploads a pad's content shows through `/raw/{id}` links.
-fn asset_refs(content: &str) -> Vec<Id> {
-    let mut ids: Vec<Id> = content
-        .match_indices("/raw/")
-        .filter_map(|(start, prefix)| {
-            let rest = &content[start + prefix.len()..];
-            let end = rest
-                .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+')))
-                .unwrap_or(rest.len());
-            rest[..end].parse().ok()
-        })
-        .collect();
-    ids.sort_by_key(|id| id.to_i64());
-    ids.dedup();
-    ids
 }
 
 /// A saved pad, without its content.
@@ -226,7 +227,7 @@ pub async fn get_pad(
     Ok(Json(loaded(highlighter, id, data).await))
 }
 
-/// POST handler creating a new pad.
+/// POST handler creating a new pad. Retries with the same `create_key` return the same pad.
 pub async fn create_pad(
     State(db): State<Database>,
     State(page): State<Page>,
@@ -234,6 +235,16 @@ pub async fn create_pad(
     Json(req): Json<PadWriteRequest>,
 ) -> Result<Json<PadResponse>, JsonErrorResponse> {
     let extension = pad_extension(&req)?;
+
+    // Held until the pad is recorded, so that a retry racing the original waits for it.
+    let mut created = CREATED.lock().await;
+    created.retain(|_, (_, at)| at.elapsed() < CREATE_KEY_TTL);
+    if let Some((id, _)) = req.create_key.as_ref().and_then(|key| created.get(key))
+        && let Ok(metadata) = db.get_metadata(*id).await
+    {
+        let extension = metadata.extension.clone().unwrap_or(extension);
+        return Ok(Json(saved(*id, extension, &metadata)));
+    }
 
     let entry = write::Entry {
         extension: Some(extension.clone()),
@@ -247,12 +258,14 @@ pub async fn create_pad(
         text: req.content,
         ..Default::default()
     };
-    let assets = asset_refs(&entry.text);
 
     let (id, _) = db.insert(entry).await.map_err(Error::Database)?;
-    db.link_assets(id, assets).await.map_err(Error::Database)?;
-    let metadata = db.get_metadata(id).await.map_err(Error::Database)?;
+    if let Some(key) = req.create_key {
+        created.insert(key, (id, Instant::now()));
+    }
+    drop(created);
 
+    let metadata = db.get_metadata(id).await.map_err(Error::Database)?;
     broadcast(&pad_tx, "created", id, metadata.updated_at.as_deref());
     Ok(Json(saved(id, extension, &metadata)))
 }
@@ -271,14 +284,13 @@ pub async fn update_pad(
     let id = parse_pad_id(&id)?;
     let extension = pad_extension(&req)?;
     let has_base = req.base_revision.is_some();
-    let assets = asset_refs(&req.content);
 
     let update = write::PadUpdate {
         extension: Some(extension.clone()),
         preview: req
             .preview
             .as_deref()
-            .and_then(|p| trimmed(p, MAX_PREVIEW_CHARS)),
+            .map(|p| trimmed(p, MAX_PREVIEW_CHARS)),
         title: req.title.as_deref().map(|t| trimmed(t, usize::MAX)),
         expires: req.expires.map(NonZeroU32::new),
         base_revision: req.base_revision,
@@ -296,7 +308,6 @@ pub async fn update_pad(
         Err(err) => return Err(Error::Database(err).into()),
     };
 
-    db.link_assets(id, assets).await.map_err(Error::Database)?;
     // The paste views never cache pads, but drop anything cached for this id before it became
     // mutable.
     cache.remove(id);
@@ -305,7 +316,7 @@ pub async fn update_pad(
     Ok(Json(saved(id, extension, &metadata)).into_response())
 }
 
-/// DELETE handler for a pad and the uploads it shows. Entries that are not pads are reported as
+/// DELETE handler for a pad and the uploads it owns. Entries that are not pads are reported as
 /// not found and left alone.
 pub async fn delete_pad(
     State(db): State<Database>,
@@ -314,13 +325,8 @@ pub async fn delete_pad(
     Path(id): Path<String>,
 ) -> Result<StatusCode, JsonErrorResponse> {
     let id = parse_pad_id(&id)?;
-    let data = db.get_pad(id).await.map_err(Error::Database)?;
 
-    if !db
-        .delete_pad(id, asset_refs(&data.text))
-        .await
-        .map_err(Error::Database)?
-    {
+    if !db.delete_pad(id).await.map_err(Error::Database)? {
         return Err(Error::Database(db::Error::NotFound).into());
     }
 
@@ -330,7 +336,7 @@ pub async fn delete_pad(
 }
 
 /// POST handler storing an image or PDF pasted or dropped into the pad editor. The body is the
-/// file itself, typed by its `Content-Type`.
+/// file itself, typed by its `Content-Type`; `?pad=` names the pad it belongs to.
 pub async fn upload_asset(
     State(db): State<Database>,
     Query(query): Query<AssetQuery>,
@@ -351,14 +357,19 @@ pub async fn upload_asset(
         return Err(bad_request(StatusCode::BAD_REQUEST, "empty upload"));
     }
 
+    let owner = match query.pad.as_deref() {
+        Some(pad) => {
+            let pad = parse_pad_id(pad)?;
+            db.get_pad(pad).await.map_err(Error::Database)?;
+            Some(pad)
+        }
+        None => None,
+    };
+    let expires = owner.map_or(NonZeroU32::new(UNOWNED_ASSET_EXPIRY), |_| None);
+
     let title = query.filename.as_deref().and_then(|f| trimmed(f, 255));
     let id = db
-        .insert_asset(
-            &body,
-            ext,
-            title.clone(),
-            NonZeroU32::new(PENDING_ASSET_EXPIRY),
-        )
+        .insert_asset(&body, ext, title.clone(), expires, owner)
         .await
         .map_err(Error::Database)?;
 
@@ -605,57 +616,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pad_assets_expire_and_go_with_it() -> Result<(), Box<dyn std::error::Error>> {
+    async fn assets_belong_to_the_pad_they_were_uploaded_into()
+    -> Result<(), Box<dyn std::error::Error>> {
         let client = Client::new(StoreCookies(false)).await;
+        let document = |content: &str| PadWriteRequest {
+            extension: Some("rich".to_string()),
+            ..write(content)
+        };
 
+        let pad_a = create(&client, &document("a")).await?;
         let url = client
-            .upload_asset(b"\x89PNG", "image/png", "a.png")
+            .upload_asset_into(b"\x89PNG", "image/png", "a.png", Some(&pad_a.id))
             .await?;
-        let paste = client
-            .post_form()
-            .form(&Entry {
-                text: String::from("unrelated"),
-                ..Default::default()
-            })
-            .send()
-            .await?;
-        let paste = paste
-            .headers()
-            .get("location")
-            .unwrap()
-            .to_str()?
-            .to_owned();
         let view = url.replacen("/raw", "", 1);
 
-        // A fresh upload expires unless a pad shows it.
+        // Owned uploads don't expire on their own; unowned ones do.
         let html = client.get(&view).send().await?.text().await?;
+        assert!(!html.contains("expires in"), "html: {html}");
+        let unowned = client
+            .upload_asset(b"\x89PNG", "image/png", "b.png")
+            .await?;
+        let html = client
+            .get(&unowned.replacen("/raw", "", 1))
+            .send()
+            .await?
+            .text()
+            .await?;
         assert!(html.contains("expires in"), "html: {html}");
 
-        // A document showing the upload, and (by mistake or malice) linking a regular paste.
-        let content = format!("<figure><img src=\"{url}\"></figure><a href=\"/raw{paste}\">x</a>");
-        let document = |expires| PadWriteRequest {
-            extension: Some("rich".to_string()),
-            expires: Some(expires),
-            ..write(&content)
-        };
-        let created = create(&client, &document(0)).await?;
-
-        // The upload now never expires, like its pad.
+        // Pad B showing A's upload can neither extend nor delete it.
+        let content = format!("<figure><img src=\"{url}\"></figure>");
+        let pad_b = create(
+            &client,
+            &PadWriteRequest {
+                expires: Some(3600),
+                ..document(&content)
+            },
+        )
+        .await?;
+        let res = client
+            .delete(&format!("/api/pad/{}", pad_b.id))
+            .send()
+            .await?;
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
         let html = client.get(&view).send().await?.text().await?;
         assert!(!html.contains("expires in"), "html: {html}");
 
-        // Changing the pad's expiration changes the upload's.
-        client
-            .put(&format!("/api/pad/{}", created.id))
-            .json(&document(3600))
-            .send()
-            .await?;
-        let html = client.get(&view).send().await?.text().await?;
-        assert!(html.contains("expires in"), "html: {html}");
-
-        // Deleting the pad deletes the upload, but not the regular paste.
+        // Deleting pad A deletes its upload.
         let res = client
-            .delete(&format!("/api/pad/{}", created.id))
+            .delete(&format!("/api/pad/{}", pad_a.id))
             .send()
             .await?;
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
@@ -663,8 +672,92 @@ mod tests {
             client.get(&url).send().await?.status(),
             StatusCode::NOT_FOUND
         );
-        let res = client.get(&format!("/raw{paste}")).send().await?;
-        assert_eq!(res.text().await?, "unrelated");
+
+        // Uploading into something that is not a pad is refused.
+        let res = client
+            .post("/api/asset?pad=aaaaaaaaaaa")
+            .header(header::CONTENT_TYPE, "image/png")
+            .body(&b"\x89PNG"[..])
+            .send()
+            .await?;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pad_urls_serve_the_editor() -> Result<(), Box<dyn std::error::Error>> {
+        let client = Client::new(StoreCookies(false)).await;
+        let created = create(&client, &write("text")).await?;
+
+        let res = client.get(&format!("/pad/{}", created.id)).send().await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(res.text().await?.contains("id=\"doc-editor\""));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_is_idempotent_per_key() -> Result<(), Box<dyn std::error::Error>> {
+        let client = Client::new(StoreCookies(false)).await;
+
+        let req = PadWriteRequest {
+            create_key: Some("retry-me".to_string()),
+            ..write("first attempt")
+        };
+        let first = create(&client, &req).await?;
+        let again = create(&client, &req).await?;
+        assert_eq!(first.id, again.id);
+        assert_eq!(first.revision, again.revision);
+
+        let other = create(
+            &client,
+            &PadWriteRequest {
+                create_key: Some("another".to_string()),
+                ..write("second pad")
+            },
+        )
+        .await?;
+        assert_ne!(other.id, first.id);
+
+        let pads = client
+            .get("/api/pads")
+            .send()
+            .await?
+            .json::<Vec<PadSummary>>()
+            .await?;
+        assert_eq!(pads.len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_preview_keeps_the_label() -> Result<(), Box<dyn std::error::Error>> {
+        let client = Client::new(StoreCookies(false)).await;
+
+        let created = create(
+            &client,
+            &PadWriteRequest {
+                preview: Some("label".to_string()),
+                title: Some("   ".to_string()),
+                ..write("label")
+            },
+        )
+        .await?;
+        client
+            .put(&format!("/api/pad/{}", created.id))
+            .json(&write("label, edited by a client that sends no preview"))
+            .send()
+            .await?;
+
+        let pads = client
+            .get("/api/pads")
+            .send()
+            .await?
+            .json::<Vec<PadSummary>>()
+            .await?;
+        assert_eq!(pads[0].preview.as_deref(), Some("label"));
+        assert_eq!(pads[0].title, None);
 
         Ok(())
     }
@@ -746,18 +839,5 @@ mod tests {
         assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 
         Ok(())
-    }
-
-    #[test]
-    fn finds_asset_references() {
-        let content =
-            "<img src=\"/raw/kSuZw254mBk.png\"><a>/raw/+li+CV4q-Hl</a> /raw/kSuZw254mBk.png";
-        let ids: Vec<String> = asset_refs(content)
-            .iter()
-            .map(ToString::to_string)
-            .collect();
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&"kSuZw254mBk".to_string()));
-        assert!(ids.contains(&"+li+CV4q-Hl".to_string()));
     }
 }

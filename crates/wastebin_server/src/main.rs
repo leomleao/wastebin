@@ -227,6 +227,7 @@ fn make_app(state: AppState, timeout: Duration, max_body_size: usize) -> Router 
         .route("/robots.txt", get(robots::get))
         .route("/theme", get(theme::get))
         .route("/new", get(html::index::get).post(insert::form::post))
+        .route("/pad/{id}", get(html::index::get))
         .route("/api/pads", get(pad::list_pads))
         .route("/api/pad/latest", get(pad::get_latest))
         .route("/api/pad", post(pad::create_pad))

@@ -101,8 +101,22 @@ impl Client {
         mime: &str,
         filename: &str,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        self.upload_asset_into(bytes, mime, filename, None).await
+    }
+
+    /// Upload an asset into `pad` through the pad API and return its `/raw/` URL.
+    pub(crate) async fn upload_asset_into(
+        &self,
+        bytes: &'static [u8],
+        mime: &str,
+        filename: &str,
+        pad: Option<&str>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let mut query = vec![("filename", filename)];
+        query.extend(pad.map(|pad| ("pad", pad)));
         let res = self
-            .post(&format!("/api/asset?filename={filename}"))
+            .post("/api/asset")
+            .query(&query)
             .header(reqwest::header::CONTENT_TYPE, mime)
             .body(bytes)
             .send()

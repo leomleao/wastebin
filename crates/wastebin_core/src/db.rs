@@ -59,6 +59,10 @@ struct Handler {
     write_seq: u64,
 }
 
+/// SQL condition for an entry that has not expired. Reads and pad updates share it, so that an
+/// entry at its expiration instant is either live for both or expired for both.
+const LIVE: &str = "(expires IS NULL OR expires >= datetime('now'))";
+
 /// Commands issued to the database handler and corresponding to [`Database`] calls.
 enum Command {
     Insert {
@@ -101,14 +105,8 @@ enum Command {
         data: Vec<u8>,
         result: oneshot::Sender<Result<Metadata, Error>>,
     },
-    LinkAssets {
-        pad: Id,
-        assets: Vec<Id>,
-        result: oneshot::Sender<Result<(), Error>>,
-    },
     DeletePad {
         id: Id,
-        assets: Vec<Id>,
         result: oneshot::Sender<Result<bool, Error>>,
     },
     GetLatestPadId {
@@ -133,6 +131,7 @@ pub enum Open {
 pub mod write {
     use crate::crypto::{Encrypted, Password, Plaintext};
     use crate::db::Error;
+    use crate::id::Id;
     use async_compression::tokio::bufread::ZstdEncoder;
     use chacha20poly1305::XNonce;
     use serde::{Deserialize, Serialize};
@@ -166,6 +165,9 @@ pub mod write {
         /// Label of a pad in the pad list
         #[serde(default)]
         pub preview: Option<String>,
+        /// Pad an asset belongs to: the asset is deleted with it.
+        #[serde(skip)]
+        pub owner: Option<Id>,
     }
 
     /// New content and optional metadata changes for an existing pad.
@@ -175,8 +177,8 @@ pub mod write {
         pub text: String,
         /// File extension
         pub extension: Option<String>,
-        /// Label in the pad list
-        pub preview: Option<String>,
+        /// `Some` replaces the label in the pad list (`Some(None)` clears it), `None` keeps it.
+        pub preview: Option<Option<String>>,
         /// `Some` replaces the title (`Some(None)` clears it), `None` keeps it.
         pub title: Option<Option<String>>,
         /// `Some` resets the expiration (`Some(None)` never expires), `None` keeps it.
@@ -498,15 +500,8 @@ impl Handler {
                 } => result
                     .send(self.update_pad(id, update, data))
                     .map_err(|_| Error::ResultSendError),
-                Command::LinkAssets {
-                    pad,
-                    assets,
-                    result,
-                } => result
-                    .send(self.link_assets(pad, &assets))
-                    .map_err(|_| Error::ResultSendError),
-                Command::DeletePad { id, assets, result } => result
-                    .send(self.delete_pad(id, &assets))
+                Command::DeletePad { id, result } => result
+                    .send(self.delete_pad(id))
                     .map_err(|_| Error::ResultSendError),
                 Command::GetLatestPadId { result } => result
                     .send(self.get_latest_pad_id())
@@ -536,7 +531,7 @@ impl Handler {
 
             let result = match entry.expires {
                 None => self.conn.execute(
-                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, title, extension, is_asset, is_pad, updated_at, preview) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, title, extension, is_asset, is_pad, updated_at, preview, owner) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         id.to_i64(),
                         entry.uid,
@@ -549,10 +544,11 @@ impl Handler {
                         entry.is_pad,
                         &updated_at,
                         entry.preview,
+                        entry.owner.map(|owner| owner.to_i64()),
                     ],
                 ),
                 Some(expires) => self.conn.execute(
-                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, expires, title, extension, is_asset, is_pad, updated_at, preview) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', ?6), ?7, ?8, ?9, ?10, ?11, ?12)",
+                    "INSERT INTO entries (id, uid, data, burn_after_reading, nonce, expires, title, extension, is_asset, is_pad, updated_at, preview, owner) VALUES (?1, ?2, ?3, ?4, ?5, datetime('now', ?6), ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         id.to_i64(),
                         entry.uid,
@@ -566,6 +562,7 @@ impl Handler {
                         entry.is_pad,
                         &updated_at,
                         entry.preview,
+                        entry.owner.map(|owner| owner.to_i64()),
                     ],
                 ),
             };
@@ -623,7 +620,7 @@ impl Handler {
     fn get(&self, id: Id) -> Result<DatabaseEntry, Error> {
         let metadata = self.get_metadata(id)?;
         let entry = self.conn.query_row(
-            "SELECT data, burn_after_reading, nonce, expires < datetime('now') FROM entries WHERE id=?1",
+            &format!("SELECT data, burn_after_reading, nonce, NOT {LIVE} FROM entries WHERE id=?1"),
             params![id.to_i64()],
             |row| {
                 let nonce = row
@@ -652,10 +649,21 @@ impl Handler {
     }
 
     fn delete(&self, id: Id) -> Result<bool, Error> {
-        Ok(self
+        let deleted = self
             .conn
             .execute("DELETE FROM entries WHERE id=?1", params![id.to_i64()])?
-            != 0)
+            != 0;
+        self.delete_owned_assets(id)?;
+        Ok(deleted)
+    }
+
+    /// Delete the assets uploaded into pad `id`.
+    fn delete_owned_assets(&self, id: Id) -> Result<(), Error> {
+        self.conn.execute(
+            "DELETE FROM entries WHERE is_asset = 1 AND owner = ?1",
+            params![id.to_i64()],
+        )?;
+        Ok(())
     }
 
     fn delete_many(&mut self, ids: Vec<Id>) -> Result<usize, Error> {
@@ -720,12 +728,17 @@ impl Handler {
         Ok(entries)
     }
 
+    /// Delete expired entries, then the assets whose pad is gone.
     fn purge(&self) -> Result<Vec<Id>, Error> {
-        let ids = self
-            .conn
-            .prepare("DELETE FROM entries WHERE expires < datetime('now') RETURNING id")?
-            .query_map([], |row| Ok(Id::from(row.get::<_, i64>(0)?)))?
-            .collect::<Result<_, _>>()?;
+        let mut ids = Vec::new();
+        for sql in [
+            "DELETE FROM entries WHERE expires < datetime('now') RETURNING id",
+            "DELETE FROM entries WHERE is_asset = 1 AND owner IS NOT NULL AND owner NOT IN (SELECT id FROM entries WHERE is_pad = 1) RETURNING id",
+        ] {
+            let mut stmt = self.conn.prepare(sql)?;
+            let deleted = stmt.query_map([], |row| Ok(Id::from(row.get::<_, i64>(0)?)))?;
+            ids.extend(deleted.collect::<Result<Vec<_>, _>>()?);
+        }
 
         Ok(ids)
     }
@@ -738,6 +751,9 @@ impl Handler {
     ) -> Result<Metadata, Error> {
         let updated_at = self.next_updated_at()?;
         let (set_title, title) = update.title.map_or((false, None), |title| (true, title));
+        let (set_preview, preview) = update
+            .preview
+            .map_or((false, None), |preview| (true, preview));
         let (set_expires, expires) = update.expires.map_or((false, None), |expires| {
             (true, expires.map(|secs| format!("{secs} seconds")))
         });
@@ -746,17 +762,20 @@ impl Handler {
         // asset entries, never creates a row for an unknown id and, given a base revision, never
         // overwrites a newer write.
         let affected = self.conn.execute(
-            "UPDATE entries SET data = ?2, extension = ?3, preview = ?4, updated_at = ?5,
-                title = CASE WHEN ?6 THEN ?7 ELSE title END,
-                expires = CASE WHEN ?8 THEN datetime('now', ?9) ELSE expires END
-            WHERE id = ?1 AND is_pad = 1 AND (expires IS NULL OR expires > datetime('now'))
-                AND (?10 IS NULL OR updated_at = ?10)",
+            &format!(
+                "UPDATE entries SET data = ?2, extension = ?3, updated_at = ?4,
+                    preview = CASE WHEN ?5 THEN ?6 ELSE preview END,
+                    title = CASE WHEN ?7 THEN ?8 ELSE title END,
+                    expires = CASE WHEN ?9 THEN datetime('now', ?10) ELSE expires END
+                WHERE id = ?1 AND is_pad = 1 AND {LIVE} AND (?11 IS NULL OR updated_at = ?11)"
+            ),
             params![
                 id.to_i64(),
                 data,
                 update.extension,
-                update.preview,
                 updated_at,
+                set_preview,
+                preview,
                 set_title,
                 title,
                 set_expires,
@@ -772,33 +791,15 @@ impl Handler {
         self.get_metadata(id)
     }
 
-    /// Let the `assets` shown by `pad` expire together with it.
-    fn link_assets(&self, pad: Id, assets: &[Id]) -> Result<(), Error> {
-        let mut stmt = self.conn.prepare(
-            "UPDATE entries SET expires = (SELECT expires FROM entries WHERE id = ?1) WHERE id = ?2 AND is_asset = 1",
-        )?;
-        for asset in assets {
-            stmt.execute(params![pad.to_i64(), asset.to_i64()])?;
-        }
-        Ok(())
-    }
-
-    /// Delete the live pad `id` and the `assets` it shows.
-    fn delete_pad(&mut self, id: Id, assets: &[Id]) -> Result<bool, Error> {
-        let tx = self.conn.transaction()?;
-        let deleted = tx.execute(
+    /// Delete the live pad `id` and the assets uploaded into it.
+    fn delete_pad(&self, id: Id) -> Result<bool, Error> {
+        let deleted = self.conn.execute(
             "DELETE FROM entries WHERE id = ?1 AND is_pad = 1",
             params![id.to_i64()],
         )? != 0;
         if deleted {
-            for asset in assets {
-                tx.execute(
-                    "DELETE FROM entries WHERE id = ?1 AND is_asset = 1",
-                    params![asset.to_i64()],
-                )?;
-            }
+            self.delete_owned_assets(id)?;
         }
-        tx.commit()?;
         Ok(deleted)
     }
 
@@ -806,7 +807,7 @@ impl Handler {
         let id = self
             .conn
             .query_row(
-                "SELECT id FROM entries WHERE is_pad = 1 AND (expires IS NULL OR expires > datetime('now')) ORDER BY updated_at DESC, rowid DESC LIMIT 1",
+                &format!("SELECT id FROM entries WHERE is_pad = 1 AND {LIVE} ORDER BY updated_at DESC, rowid DESC LIMIT 1"),
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -818,7 +819,7 @@ impl Handler {
     fn list_recent_pads(&self, limit: usize) -> Result<Vec<PadSummary>, Error> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, preview, updated_at FROM entries WHERE is_pad = 1 AND (expires IS NULL OR expires > datetime('now')) ORDER BY updated_at DESC, rowid DESC LIMIT ?1",
+            &format!("SELECT id, NULLIF(TRIM(title), ''), preview, updated_at FROM entries WHERE is_pad = 1 AND {LIVE} ORDER BY updated_at DESC, rowid DESC LIMIT ?1"),
         )?;
 
         let pads = stmt
@@ -892,9 +893,9 @@ fn to_rfc3339(value: &str) -> Option<String> {
     Some(format!("{}Z", datetime.replacen(' ', "T", 1)))
 }
 
-/// Migration hook for 0011. Pads written in document mode by older builds were stored with the
-/// `html` extension: mark them `rich`, so that only the explicit document extension remains.
-/// Also give existing pads the list label the editor now stores on save.
+/// Migration hook for 0011. Pads written by the old visual editor were stored with the `html`
+/// extension: mark them `rich`, so that only the explicit document extension remains. Pads of
+/// HTML source stay `html`. Also give existing pads the list label the editor now stores on save.
 fn migrate_pads(tx: &Transaction) -> Result<(), HookError> {
     let rows = tx
         .prepare("SELECT id, data, extension FROM entries WHERE is_pad = 1 AND nonce IS NULL")?
@@ -908,17 +909,16 @@ fn migrate_pads(tx: &Transaction) -> Result<(), HookError> {
         .collect::<Result<Vec<_>, _>>()?;
 
     for (id, data, extension) in rows {
-        let text = zstd::stream::decode_all(Cursor::new(data))
-            .map_err(|e| HookError::Hook(e.to_string()))?;
+        let Ok(text) = zstd::stream::decode_all(Cursor::new(data)) else {
+            tracing::warn!(id, "skipping pad that cannot be decompressed");
+            continue;
+        };
         let text = String::from_utf8_lossy(&text);
-        let trimmed = text.trim_start();
-        let is_document = extension.as_deref() == Some("rich")
-            || (extension.as_deref() == Some("html")
-                && !trimmed.starts_with("<!DOCTYPE")
-                && !trimmed.starts_with("<html")
-                && ["<figure", "<img ", "<table", "<p>", "<div>"]
-                    .iter()
-                    .any(|tag| text.contains(tag)));
+        let is_document = match extension.as_deref() {
+            Some("rich") => true,
+            Some("html") => is_legacy_document(&text),
+            _ => false,
+        };
 
         tx.execute(
             "UPDATE entries SET extension = CASE WHEN ?2 THEN 'rich' ELSE extension END, preview = ?3 WHERE id = ?1",
@@ -927,6 +927,15 @@ fn migrate_pads(tx: &Transaction) -> Result<(), HookError> {
     }
 
     Ok(())
+}
+
+/// Whether `text` carries the markup of the old visual editor rather than HTML source.
+fn is_legacy_document(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    text.contains("class=\"inline-asset")
+        || text.contains("contenteditable=\"false\"")
+        || trimmed.starts_with("<p>")
+        || trimmed.starts_with("<pre class=\"code-block\">")
 }
 
 /// First line of a pad's text without Markdown markers; for documents, markup and inline asset
@@ -1136,13 +1145,15 @@ impl Database {
         }
     }
 
-    /// Store an image or PDF uploaded from the pad editor.
+    /// Store an image or PDF uploaded from the pad editor into pad `owner`, which deletes it
+    /// along with itself.
     pub async fn insert_asset(
         &self,
         bytes: &[u8],
         extension: &str,
         title: Option<String>,
         expires: Option<NonZeroU32>,
+        owner: Option<Id>,
     ) -> Result<Id, Error> {
         let entry = write::DatabaseEntry {
             data: write::compress(bytes).await?,
@@ -1151,6 +1162,7 @@ impl Database {
                 title,
                 expires,
                 is_asset: true,
+                owner,
                 ..Default::default()
             },
             nonce: None,
@@ -1184,30 +1196,12 @@ impl Database {
         command_result.await?
     }
 
-    /// Let the `assets` shown by `pad` expire together with it.
-    pub async fn link_assets(&self, pad: Id, assets: Vec<Id>) -> Result<(), Error> {
-        if assets.is_empty() {
-            return Ok(());
-        }
-
+    /// Delete the live pad `id` and the assets uploaded into it. Returns `false` if `id` is not a
+    /// pad.
+    pub async fn delete_pad(&self, id: Id) -> Result<bool, Error> {
         let (result, command_result) = oneshot::channel();
         self.sender
-            .send(Command::LinkAssets {
-                pad,
-                assets,
-                result,
-            })
-            .await
-            .map_err(|_| Error::SendError)?;
-        command_result.await?
-    }
-
-    /// Delete the live pad `id` and the `assets` it shows. Returns `false` if `id` is not a pad;
-    /// ids in `assets` that are not assets are left alone.
-    pub async fn delete_pad(&self, id: Id, assets: Vec<Id>) -> Result<bool, Error> {
-        let (result, command_result) = oneshot::channel();
-        self.sender
-            .send(Command::DeletePad { id, assets, result })
+            .send(Command::DeletePad { id, result })
             .await
             .map_err(|_| Error::SendError)?;
         command_result.await?
@@ -1522,7 +1516,13 @@ mod tests {
         let db = new_db()?;
 
         let id = db
-            .insert_asset(&[1, 2, 3, 4, 5], "png", Some("test.png".to_string()), None)
+            .insert_asset(
+                &[1, 2, 3, 4, 5],
+                "png",
+                Some("test.png".to_string()),
+                None,
+                None,
+            )
             .await?;
 
         let data = db.get(id, None).await?.unwrap_inner();
@@ -1675,7 +1675,7 @@ mod tests {
                 db.update_pad(id, change("clobbered")).await,
                 Err(Error::NotFound)
             ));
-            assert!(!db.delete_pad(id, Vec::new()).await?);
+            assert!(!db.delete_pad(id).await?);
         }
 
         // Nothing was burned, modified or inserted.
@@ -1695,11 +1695,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assets_follow_their_pad() -> Result<(), Box<dyn std::error::Error>> {
+    async fn assets_belong_to_their_pad() -> Result<(), Box<dyn std::error::Error>> {
         let db = new_db()?;
 
+        let (pad_a, _) = db.insert(pad("a")).await?;
+        let (pad_b, _) = db.insert(pad("b")).await?;
         let asset = db
-            .insert_asset(b"png", "png", None, NonZeroU32::new(60))
+            .insert_asset(b"png", "png", None, None, Some(pad_a))
             .await?;
         let (paste, _) = db
             .insert(write::Entry {
@@ -1707,27 +1709,65 @@ mod tests {
                 ..Default::default()
             })
             .await?;
-        let (id, _) = db.insert(pad("pad")).await?;
 
-        // The pad never expires, so neither does the asset it shows.
-        db.link_assets(id, vec![asset, paste]).await?;
-        assert!(db.get_metadata(asset).await?.expiration.is_none());
-
+        // Pad B showing A's asset can neither extend nor delete it.
         let update = write::PadUpdate {
-            expires: NonZeroU32::new(3600).map(Some),
-            ..change("pad")
+            expires: NonZeroU32::new(60).map(Some),
+            ..change(&format!("<img src=\"/raw/{asset}.png\">"))
         };
-        db.update_pad(id, update).await?;
-        db.link_assets(id, vec![asset]).await?;
-        assert!(db.get_metadata(asset).await?.expiration.is_some());
+        db.update_pad(pad_b, update).await?;
+        assert!(db.delete_pad(pad_b).await?);
+        assert!(db.get_metadata(asset).await?.expiration.is_none());
+        assert_eq!(db.get(asset, None).await?.unwrap_inner().bytes, b"png");
 
-        // Deleting the pad deletes its assets, but never other entries.
-        assert!(db.delete_pad(id, vec![asset, paste]).await?);
+        // Deleting pad A deletes its asset, and nothing else.
+        assert!(db.delete_pad(pad_a).await?);
         assert!(matches!(db.get(asset, None).await, Err(Error::NotFound)));
         assert_eq!(
             db.get(paste, None).await?.unwrap_inner().text,
             "not an asset"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_removes_assets_of_missing_pads() -> Result<(), Box<dyn std::error::Error>> {
+        let db = new_db()?;
+
+        let (gone, _) = db.insert(pad("gone")).await?;
+        let (kept, _) = db.insert(pad("kept")).await?;
+        let orphan = db
+            .insert_asset(b"png", "png", None, None, Some(gone))
+            .await?;
+        let owned = db
+            .insert_asset(b"png", "png", None, None, Some(kept))
+            .await?;
+        let unowned = db.insert_asset(b"png", "png", None, None, None).await?;
+
+        // The pad row disappears without taking its asset along, as expired rows do in a purge.
+        db.delete_many(vec![gone]).await?;
+
+        assert_eq!(db.purge().await?, vec![orphan]);
+        assert!(db.get(owned, None).await.is_ok());
+        assert!(db.get(unowned, None).await.is_ok());
+
+        Ok(())
+    }
+
+    #[test]
+    fn expiration_boundary_is_consistent() -> Result<(), Box<dyn std::error::Error>> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute("CREATE TABLE entries (expires TEXT)", [])?;
+        conn.execute("INSERT INTO entries VALUES (datetime('now'))", [])?;
+
+        // What reads consider expired is exactly what pad updates consider not live.
+        let (live, expired): (bool, bool) = conn.query_row(
+            &format!("SELECT {LIVE}, expires < datetime('now') FROM entries"),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_ne!(live, expired);
 
         Ok(())
     }
@@ -1757,7 +1797,7 @@ mod tests {
             ..Default::default()
         })
         .await?;
-        db.insert_asset(b"png", "png", None, None).await?;
+        db.insert_asset(b"png", "png", None, None, None).await?;
 
         let (latest_id, latest_data) = db.get_latest_pad().await?.expect("latest pad exists");
         assert_eq!(latest_id, pad2_id);
@@ -1785,16 +1825,17 @@ mod tests {
         let migrations = migrations();
         migrations.to_version(&mut conn, 10)?;
 
-        let rows: [(i64, &str, &str, bool); 4] = [
+        let rows: [(i64, &str, &str, bool); 5] = [
             (1, "png", "binary", false),
             (2, "rs", "fn main() {}", false),
             (
                 3,
                 "html",
-                "<div>notes</div><figure><img src=\"/raw/a.png\"></figure>",
+                "<div>notes</div><figure class=\"inline-asset inline-image\"><img src=\"/raw/a.png\"></figure>",
                 true,
             ),
             (4, "html", "<!DOCTYPE html><html><p>source</p></html>", true),
+            (5, "html", "<div class=\"card\"><p>fragment</p></div>", true),
         ];
         for (id, ext, text, is_pad) in rows {
             let data = zstd::stream::encode_all(Cursor::new(text), 0)?;
@@ -1803,6 +1844,20 @@ mod tests {
                 params![id, data, ext, is_pad],
             )?;
         }
+        // Encrypted and burn-after-reading pictures, and a pad that cannot be decompressed.
+        let png = zstd::stream::encode_all(Cursor::new("binary"), 0)?;
+        conn.execute(
+            "INSERT INTO entries (id, data, extension, nonce) VALUES (6, ?1, 'png', x'00')",
+            params![png],
+        )?;
+        conn.execute(
+            "INSERT INTO entries (id, data, extension, burn_after_reading) VALUES (7, ?1, 'pdf', 1)",
+            params![png],
+        )?;
+        conn.execute(
+            "INSERT INTO entries (id, data, extension, is_pad) VALUES (8, x'0102', 'html', 1)",
+            [],
+        )?;
 
         migrations.to_latest(&mut conn)?;
 
@@ -1817,6 +1872,10 @@ mod tests {
         assert_eq!(row(2)?, ("rs".to_string(), false));
         assert_eq!(row(3)?, ("rich".to_string(), false));
         assert_eq!(row(4)?, ("html".to_string(), false));
+        assert_eq!(row(5)?, ("html".to_string(), false));
+        assert_eq!(row(6)?, ("png".to_string(), false));
+        assert_eq!(row(7)?, ("pdf".to_string(), false));
+        assert_eq!(row(8)?, ("html".to_string(), false));
 
         let preview = |id: i64| {
             conn.query_row(
