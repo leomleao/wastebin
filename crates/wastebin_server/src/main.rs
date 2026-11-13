@@ -6,6 +6,8 @@ mod errors;
 mod handlers;
 mod i18n;
 mod mcp;
+#[cfg(test)]
+mod mcp_tests;
 pub(crate) mod media;
 mod pads;
 mod page;

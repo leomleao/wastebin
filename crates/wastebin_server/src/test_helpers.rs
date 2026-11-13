@@ -16,18 +16,23 @@ use wastebin_highlight::{Highlighter, Theme};
 
 /// Application state with an in-memory database, whose handler runs on the current runtime.
 pub(crate) fn state() -> crate::AppState {
+    state_with("0", true)
+}
+
+/// [`state`] with the expiration options `expirations` and MCP enabled if `mcp`.
+pub(crate) fn state_with(expirations: &str, mcp: bool) -> crate::AppState {
     let (db, handler) = Database::new(db::Open::Memory).expect("open memory database");
     tokio::spawn(handler);
     let cache = Cache::new(NonZeroUsize::new(128).unwrap()).unwrap();
     let key = Key::generate();
-    let expirations = "0".parse::<ExpirationSet>().unwrap();
+    let expirations = expirations.parse::<ExpirationSet>().unwrap();
     let page = Arc::new(page::Page::new(
         String::from("test"),
         url::Url::parse("https://localhost:8888").unwrap(),
         Theme::Ayu,
         expirations,
         1024 * 1024,
-        true,
+        mcp,
     ));
     crate::AppState {
         db,
@@ -54,8 +59,15 @@ impl Client {
 
     /// Server whose requests time out after `timeout`.
     pub(crate) async fn with_timeout(store_cookies: StoreCookies, timeout: Duration) -> Self {
-        let state = state();
+        Self::with_state(state(), store_cookies, timeout).await
+    }
 
+    /// Server of `state` whose requests time out after `timeout`.
+    pub(crate) async fn with_state(
+        state: crate::AppState,
+        store_cookies: StoreCookies,
+        timeout: Duration,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("Could not bind ephemeral socket");
