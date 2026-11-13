@@ -21,6 +21,15 @@ pub(crate) fn state() -> crate::AppState {
 
 /// [`state`] with the expiration options `expirations` and MCP enabled if `mcp`.
 pub(crate) fn state_with(expirations: &str, mcp: bool) -> crate::AppState {
+    build_state(expirations, mcp, 1024 * 1024)
+}
+
+/// [`state`] with requests limited to `max_body_size` bytes.
+pub(crate) fn state_with_limit(max_body_size: usize) -> crate::AppState {
+    build_state("0", true, max_body_size)
+}
+
+fn build_state(expirations: &str, mcp: bool, max_body_size: usize) -> crate::AppState {
     let (db, handler) = Database::new(db::Open::Memory).expect("open memory database");
     tokio::spawn(handler);
     let cache = Cache::new(NonZeroUsize::new(128).unwrap()).unwrap();
@@ -31,7 +40,7 @@ pub(crate) fn state_with(expirations: &str, mcp: bool) -> crate::AppState {
         url::Url::parse("https://localhost:8888").unwrap(),
         Theme::Ayu,
         expirations,
-        1024 * 1024,
+        max_body_size,
         mcp,
     ));
     crate::AppState {
@@ -75,7 +84,8 @@ impl Client {
         let addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            let app = crate::make_app(state, timeout, 1024 * 1024);
+            let max_body_size = state.page.max_body_size;
+            let app = crate::make_app(state, timeout, max_body_size);
 
             axum::serve(listener, app)
                 .with_graceful_shutdown(crate::shutdown_signal())

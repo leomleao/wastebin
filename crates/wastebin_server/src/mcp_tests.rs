@@ -8,7 +8,7 @@ use reqwest::StatusCode;
 use serde_json::{Value, json};
 
 use crate::handlers::extract::verify_owner_token;
-use crate::test_helpers::{Client, StoreCookies, state_with};
+use crate::test_helpers::{Client, StoreCookies, state_with, state_with_limit};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -841,30 +841,70 @@ async fn upload_file_rejects_other_types_and_oversize() -> TestResult {
     .await?;
     assert!(err.contains("base64"), "{err}");
 
-    // Over the server's body size limit (1 MiB in tests) once encoded.
-    let big = vec![0u8; 900 * 1024];
-    let res = post_rpc(
+    // Over the server's body size limit (1 MiB in tests).
+    let big = vec![0u8; 1024 * 1024 + 1];
+    let err = call_err(
         &client,
-        "tools/call",
-        &json!({
-            "name": "upload_file",
-            "arguments": { "pad": pad_id, "filename": "big.png", "data_base64": BASE64.encode(&big) },
-        }),
+        "upload_file",
+        json!({ "pad": pad_id, "filename": "big.png", "data_base64": BASE64.encode(&big) }),
     )
     .await?;
-    let status = res.status();
-    let body = res.text().await.unwrap_or_default();
-    let rejected = status == StatusCode::PAYLOAD_TOO_LARGE
-        || status.is_client_error()
-        || serde_json::from_str::<Value>(&body)
-            .is_ok_and(|b| b.get("error").is_some() || b["result"]["isError"] == true);
-    assert!(rejected, "{status}: {}", &body[..body.len().min(300)]);
+    assert!(err.contains("1048576"), "{err}");
 
     // The pad is untouched.
     let read = read_pad(&client, pad_id).await?;
     assert_eq!(read["files"], json!([]));
     assert_eq!(read["text"], "keep");
     assert_eq!(read["revision"], revision.as_str());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_file_takes_what_the_asset_api_takes() -> TestResult {
+    const MAX: usize = 4096;
+    let client = Client::with_state(
+        state_with_limit(MAX),
+        StoreCookies(false),
+        Duration::from_secs(30),
+    )
+    .await;
+    let pad = create_pad(&client, json!({ "text": "notes", "language": "txt" })).await?;
+    let pad_id = str_of(&pad, "id");
+
+    let file = |len: usize| [PNG, &vec![0; len - PNG.len()]].concat();
+    let over_http = async |bytes: Vec<u8>| {
+        client
+            .post("/api/asset")
+            .query(&[("pad", pad_id), ("filename", "a.png")])
+            .header(reqwest::header::CONTENT_TYPE, "image/png")
+            .body(bytes)
+            .send()
+            .await
+            .map(|res| res.status())
+    };
+    let upload = |bytes: &[u8]| json!({ "pad": pad_id, "filename": "a.png", "data_base64": BASE64.encode(bytes) });
+
+    // At the limit: both take it.
+    assert_eq!(over_http(file(MAX)).await?, StatusCode::OK);
+    call(&client, "upload_file", upload(&file(MAX))).await?;
+
+    // Over it: both refuse it, MCP with a tool error naming the limit.
+    assert_eq!(
+        over_http(file(MAX + 1)).await?,
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    let err = call_err(&client, "upload_file", upload(&file(MAX + 1))).await?;
+    assert!(err.contains("4096"), "{err}");
+
+    // Far over it, the request itself is refused.
+    let res = post_rpc(
+        &client,
+        "tools/call",
+        &json!({ "name": "upload_file", "arguments": upload(&file(100 * MAX)) }),
+    )
+    .await?;
+    assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
     Ok(())
 }

@@ -45,7 +45,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .with_json_response(true)
         // Open like the rest of the API: checking the Host header would only lock out LAN clients.
         .disable_allowed_hosts()
-        .with_max_request_body_bytes(state.page.max_body_size);
+        .with_max_request_body_bytes(body_limit(state.page.max_body_size));
 
     let base_url = std::env::var(wastebin_core::env::vars::BASE_URL)
         .is_ok()
@@ -66,6 +66,15 @@ pub(crate) fn router(state: AppState) -> Router {
     );
 
     Router::new().nest_service("/mcp", service)
+}
+
+/// Largest request: a file of `max_body_size` bytes, the largest `/api/asset` takes, in base64,
+/// with room for the rest of the call. Larger files are refused by `upload_file` itself.
+fn body_limit(max_body_size: usize) -> usize {
+    max_body_size
+        .div_ceil(3)
+        .saturating_mul(4)
+        .saturating_add(64 * 1024)
 }
 
 /// Describe the `expires` arguments with the configured expiration options.
@@ -339,6 +348,10 @@ impl Mcp {
         let bytes = BASE64
             .decode(data)
             .map_err(|_| message("data_base64 is not valid base64"))?;
+        let max = self.page.max_body_size;
+        if bytes.len() > max {
+            return Err(message(format!("file too large: the limit is {max} bytes")));
+        }
         let extension = args.filename.rsplit_once('.').map(|(_, ext)| ext);
         let mime = crate::media::asset_mime(extension);
 
