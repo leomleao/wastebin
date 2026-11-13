@@ -28,7 +28,7 @@ fn raw_response(key: &Key, data: Data) -> Response {
     }
 
     let ext = key.ext.as_deref().or(data.metadata.extension.as_deref());
-    let mime = asset_mime(&data.bytes, ext);
+    let mime = asset_mime(ext);
     let csp = if mime == "application/pdf" {
         CSP_PDF
     } else {
@@ -142,7 +142,7 @@ mod tests {
         let client = Client::new(StoreCookies(false)).await;
 
         let url = client
-            .upload_asset("data:image/png;base64,iVBORw0KGgo=", "photo.png")
+            .upload_asset(b"\x89PNG\r\n\x1a\n", "image/png", "photo.png")
             .await?;
         let res = client.get(&url).send().await?;
         assert_eq!(res.status(), StatusCode::OK);
@@ -157,7 +157,7 @@ mod tests {
         assert!(!res.bytes().await?.is_empty());
 
         let url = client
-            .upload_asset("data:application/pdf;base64,JVBERi0xLjQ=", "doc.pdf")
+            .upload_asset(b"%PDF-1.4", "application/pdf", "doc.pdf")
             .await?;
         let res = client.get(&url).send().await?;
         assert_eq!(res.status(), StatusCode::OK);

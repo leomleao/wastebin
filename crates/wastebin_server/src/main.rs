@@ -236,15 +236,7 @@ fn make_app(state: AppState, timeout: Duration, max_body_size: usize) -> Router 
                 .put(pad::update_pad)
                 .delete(pad::delete_pad),
         )
-        .route("/api/pad/{id}/md", get(pad::render_markdown))
-        .route(
-            "/api/asset",
-            // Assets arrive as base64 `data:` URLs, which are 4/3 the size of the file. The
-            // handler checks the decoded size against the configured maximum.
-            post(pad::upload_asset).layer(DefaultBodyLimit::max(
-                max_body_size.saturating_mul(4) / 3 + 1024,
-            )),
-        )
+        .route("/api/asset", post(pad::upload_asset))
         .route("/qr/{id}", get(html::qr::get))
         .route(
             "/md/{id}",

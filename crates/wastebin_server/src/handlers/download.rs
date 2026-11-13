@@ -80,7 +80,7 @@ fn get_download(key: &Key, data: Data) -> Response {
     }
 
     let ext = key.ext.as_deref().or(data.metadata.extension.as_deref());
-    let mime = asset_mime(&data.bytes, ext);
+    let mime = asset_mime(ext);
 
     if !filename.contains('.')
         && let Some(ext) = ext
@@ -221,7 +221,7 @@ mod tests {
         let client = Client::new(StoreCookies(false)).await;
 
         let url = client
-            .upload_asset("data:image/png;base64,iVBORw0KGgo=", "photo")
+            .upload_asset(b"\x89PNG\r\n\x1a\n", "image/png", "photo")
             .await?;
         let res = client.get(&url.replacen("/raw/", "/dl/", 1)).send().await?;
         assert_eq!(res.status(), StatusCode::OK);
@@ -233,7 +233,7 @@ mod tests {
         assert!(content_disposition.to_str()?.contains("photo.png"));
 
         let url = client
-            .upload_asset("data:application/pdf;base64,JVBERi0xLjQ=", "paper.pdf")
+            .upload_asset(b"%PDF-1.4", "application/pdf", "paper.pdf")
             .await?;
         let res = client.get(&url.replacen("/raw/", "/dl/", 1)).send().await?;
         assert_eq!(res.status(), StatusCode::OK);

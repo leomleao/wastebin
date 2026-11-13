@@ -1,93 +1,18 @@
-use serde::Serialize;
-
 use crate::Highlighter;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct DetectedLang {
-    pub extension: String,
-    pub name: String,
-    pub is_code: bool,
-}
-
-/// Check whether `content` contains visual rich-editor HTML blocks (e.g. inline pasted assets, figures, tables, paragraphs).
-pub fn has_rich_inline_html(content: &str) -> bool {
-    let trimmed = content.trim();
-    if trimmed.starts_with("<!DOCTYPE html") || trimmed.starts_with("<html") {
-        return false;
+/// Extension of the language `content` is written in. An explicit extension other than `auto` is
+/// taken as is; documents (`rich`) are only ever chosen explicitly.
+pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> String {
+    if let Some(ext) = explicit_ext.map(str::trim)
+        && !ext.is_empty()
+        && !ext.eq_ignore_ascii_case("auto")
+    {
+        return ext.to_ascii_lowercase();
     }
 
-    content.contains("<figure")
-        || content.contains("<img ")
-        || content.contains("class=\"inline-asset\"")
-        || content.contains("class=\"inline-")
-        || content.contains("<iframe")
-        || content.contains("<table")
-        || content.contains("<p>")
-        || content.contains("<p ")
-        || content.contains("<div><br></div>")
-}
-
-fn lang_name_for_ext(ext: &str) -> (&'static str, bool) {
-    match ext.to_ascii_lowercase().as_str() {
-        "rich" => ("Document", false),
-        "txt" | "text" => ("Plain Text", false),
-        "js" | "mjs" | "cjs" => ("JavaScript", true),
-        "ts" | "tsx" => ("TypeScript", true),
-        "jsx" => ("JSX", true),
-        "php" => ("PHP", true),
-        "abap" => ("ABAP", true),
-        "md" | "markdown" => ("Markdown", true),
-        "py" | "python" => ("Python", true),
-        "sql" => ("SQL", true),
-        "json" => ("JSON", true),
-        "html" | "htm" => ("HTML", true),
-        "css" | "scss" | "less" => ("CSS", true),
-        "sh" | "bash" | "zsh" => ("Bash", true),
-        "rs" | "rust" => ("Rust", true),
-        "yaml" | "yml" => ("YAML", true),
-        "toml" => ("TOML", true),
-        "xml" | "svg" => ("XML", true),
-        "go" => ("Go", true),
-        "java" => ("Java", true),
-        "c" | "h" => ("C", true),
-        "cpp" | "cc" | "cxx" | "hpp" => ("C++", true),
-        "cs" => ("C#", true),
-        "rb" => ("Ruby", true),
-        "swift" => ("Swift", true),
-        "kt" | "kts" => ("Kotlin", true),
-        _ => ("Code", true),
-    }
-}
-
-pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLang {
-    if let Some(ext) = explicit_ext {
-        let ext_trimmed = ext.trim();
-        if ext_trimmed.eq_ignore_ascii_case("rich") {
-            return DetectedLang {
-                extension: "rich".to_string(),
-                name: "Document".to_string(),
-                is_code: false,
-            };
-        }
-        if !ext_trimmed.is_empty() && !ext_trimmed.eq_ignore_ascii_case("auto") {
-            let normalized = ext_trimmed.to_ascii_lowercase();
-            let (name, is_code) = lang_name_for_ext(&normalized);
-            return DetectedLang {
-                extension: normalized,
-                name: name.to_string(),
-                is_code,
-            };
-        }
-    }
-
-    // Document mode is only ever chosen explicitly: HTML typed into the code editor is source.
     let trimmed = content.trim();
     if trimmed.is_empty() {
-        return DetectedLang {
-            extension: "txt".to_string(),
-            name: "Plain Text".to_string(),
-            is_code: false,
-        };
+        return "txt".to_string();
     }
 
     // 1. JSON check (strict valid JSON object or array)
@@ -95,17 +20,13 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
         || (trimmed.starts_with('[') && trimmed.ends_with(']')))
         && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
     {
-        return DetectedLang {
-            extension: "json".to_string(),
-            name: "JSON".to_string(),
-            is_code: true,
-        };
+        return "json".to_string();
     }
 
     let upper = content.to_ascii_uppercase();
 
     // Score each candidate language
-    let mut scores: Vec<(&str, &str, i32)> = Vec::new();
+    let mut scores: Vec<(&str, i32)> = Vec::new();
 
     // ABAP
     let mut abap_score = 0;
@@ -140,7 +61,7 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
             abap_score += 1;
         }
     }
-    scores.push(("abap", "ABAP", abap_score));
+    scores.push(("abap", abap_score));
 
     // PHP
     let mut php_score = 0;
@@ -162,7 +83,7 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
             php_score += 2;
         }
     }
-    scores.push(("php", "PHP", php_score));
+    scores.push(("php", php_score));
 
     // TypeScript
     let mut ts_score = 0;
@@ -190,7 +111,7 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
             ts_score += 1;
         }
     }
-    scores.push(("ts", "TypeScript", ts_score));
+    scores.push(("ts", ts_score));
 
     // JavaScript
     let mut js_score = 0;
@@ -212,7 +133,7 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
             js_score += 2;
         }
     }
-    scores.push(("js", "JavaScript", js_score));
+    scores.push(("js", js_score));
 
     // Rust
     let mut rs_score = 0;
@@ -235,7 +156,7 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
             rs_score += 3;
         }
     }
-    scores.push(("rs", "Rust", rs_score));
+    scores.push(("rs", rs_score));
 
     // Python
     let mut py_score = 0;
@@ -255,7 +176,7 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
             py_score += 2;
         }
     }
-    scores.push(("py", "Python", py_score));
+    scores.push(("py", py_score));
 
     // SQL
     let mut sql_score = 0;
@@ -276,7 +197,7 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
             sql_score += 2;
         }
     }
-    scores.push(("sql", "SQL", sql_score));
+    scores.push(("sql", sql_score));
 
     // Bash / Shell
     let mut sh_score = 0;
@@ -299,7 +220,7 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
             sh_score += 2;
         }
     }
-    scores.push(("sh", "Bash", sh_score));
+    scores.push(("sh", sh_score));
 
     // HTML
     let mut html_score = 0;
@@ -311,7 +232,7 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
             html_score += 2;
         }
     }
-    scores.push(("html", "HTML", html_score));
+    scores.push(("html", html_score));
 
     // CSS
     let mut css_score = 0;
@@ -328,7 +249,7 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
             css_score += 2;
         }
     }
-    scores.push(("css", "CSS", css_score));
+    scores.push(("css", css_score));
 
     // Markdown
     let mut md_score = 0;
@@ -348,7 +269,7 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
     if content.contains("](") {
         md_score += 2;
     }
-    scores.push(("md", "Markdown", md_score));
+    scores.push(("md", md_score));
 
     // YAML
     let mut yaml_score = 0;
@@ -375,38 +296,20 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
             yaml_score += 3;
         }
     }
-    scores.push(("yaml", "YAML", yaml_score));
+    scores.push(("yaml", yaml_score));
 
-    scores.sort_by_key(|score| std::cmp::Reverse(score.2));
-    if let Some(&(ext, name, score)) = scores.first()
+    scores.sort_by_key(|score| std::cmp::Reverse(score.1));
+    if let Some(&(ext, score)) = scores.first()
         && score >= 3
     {
-        return DetectedLang {
-            extension: ext.to_string(),
-            name: name.to_string(),
-            is_code: true,
-        };
+        return ext.to_string();
     }
 
-    DetectedLang {
-        extension: "txt".to_string(),
-        name: "Plain Text".to_string(),
-        is_code: false,
-    }
-}
-
-/// Whether a pad with extension `ext` and content `text` was written in document mode. Older
-/// pads stored document markup under the `html` extension.
-pub fn is_document(ext: Option<&str>, text: &str) -> bool {
-    match ext {
-        Some(ext) if ext.eq_ignore_ascii_case("rich") => true,
-        Some(ext) if ext.eq_ignore_ascii_case("html") => has_rich_inline_html(text),
-        _ => false,
-    }
+    "txt".to_string()
 }
 
 /// Highlight `text` using `highlighter` (falling back to `"sql"` syntax for `"abap"` if syntect has
-/// no built-in ABAP syntax). The result is not cached because pads change on every keystroke.
+/// no built-in ABAP syntax). The result is not cached because pads change all the time.
 pub async fn highlight_code(highlighter: Highlighter, text: String, ext: String) -> Option<String> {
     if text.is_empty() {
         return None;
@@ -433,63 +336,40 @@ mod tests {
     #[test]
     fn detects_abap() {
         let code = "REPORT z_test_program.\nDATA: lt_mara TYPE TABLE OF mara,\n      ls_mara TYPE mara.\nSELECT * FROM mara INTO TABLE lt_mara.\nLOOP AT lt_mara INTO ls_mara.\n  WRITE: / ls_mara-matnr.\nENDLOOP.";
-        let detected = detect_language(code, None);
-        assert_eq!(detected.extension, "abap");
-        assert_eq!(detected.name, "ABAP");
-        assert!(detected.is_code);
+        assert_eq!(detect_language(code, None), "abap");
     }
 
     #[test]
     fn detects_typescript() {
         let code = "export interface User {\n  readonly id: string;\n  count: number;\n}\nconst u: User = { id: '1', count: 42 };";
-        let detected = detect_language(code, Some("auto"));
-        assert_eq!(detected.extension, "ts");
-        assert_eq!(detected.name, "TypeScript");
-        assert!(detected.is_code);
+        assert_eq!(detect_language(code, Some("auto")), "ts");
     }
 
     #[test]
     fn detects_javascript() {
         let code = "const items = [1, 2, 3];\nfunction logAll() {\n  console.log(items.map(x => x * 2));\n}\nexport default logAll;";
-        let detected = detect_language(code, None);
-        assert_eq!(detected.extension, "js");
-        assert_eq!(detected.name, "JavaScript");
-        assert!(detected.is_code);
+        assert_eq!(detect_language(code, None), "js");
     }
 
     #[test]
     fn detects_php() {
         let code =
             "<?php\nnamespace App\\Controller;\npublic function index() {\n  echo $_GET['id'];\n}";
-        let detected = detect_language(code, None);
-        assert_eq!(detected.extension, "php");
-        assert_eq!(detected.name, "PHP");
-        assert!(detected.is_code);
+        assert_eq!(detect_language(code, None), "php");
     }
 
     #[test]
     fn detects_markdown() {
         let code = "# Project Roadmap\n\n## Milestones\n- [x] Initial release\n- [ ] Live sync\n";
-        let detected = detect_language(code, None);
-        assert_eq!(detected.extension, "md");
-        assert_eq!(detected.name, "Markdown");
-        assert!(detected.is_code);
+        assert_eq!(detect_language(code, None), "md");
     }
 
     #[test]
     fn documents_are_only_explicit() {
         let doc = "<p>Here is an inline screenshot:</p><figure class=\"inline-asset\"><img src=\"/raw/abc.png\"></figure>";
-        assert_ne!(detect_language(doc, None).extension, "rich");
-        assert_ne!(detect_language(doc, Some("auto")).extension, "rich");
-
-        let detected = detect_language(doc, Some("rich"));
-        assert_eq!(detected.extension, "rich");
-        assert_eq!(detected.name, "Document");
-        assert!(!detected.is_code);
-
-        assert!(is_document(Some("rich"), "plain"));
-        assert!(is_document(Some("html"), doc));
-        assert!(!is_document(Some("html"), "<!DOCTYPE html><html></html>"));
-        assert!(!is_document(Some("rs"), doc));
+        assert_ne!(detect_language(doc, None), "rich");
+        assert_ne!(detect_language(doc, Some("auto")), "rich");
+        assert_eq!(detect_language(doc, Some("rich")), "rich");
+        assert_eq!(detect_language(doc, Some(" RS ")), "rs");
     }
 }

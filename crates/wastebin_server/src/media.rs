@@ -1,49 +1,42 @@
-//! Helpers for recognizing and formatting uploaded media (images and PDFs).
+//! Media types of the images and PDFs uploaded from the pad editor.
 
-pub fn is_image_ext(ext: Option<&str>) -> bool {
-    matches!(
-        ext.map(|s| s.to_ascii_lowercase()).as_deref(),
-        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "avif" | "bmp" | "ico" | "tiff" | "tif")
-    )
+/// Extensions and MIME types of the files the pad editor accepts.
+const TYPES: &[(&str, &str)] = &[
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("gif", "image/gif"),
+    ("webp", "image/webp"),
+    ("svg", "image/svg+xml"),
+    ("avif", "image/avif"),
+    ("bmp", "image/bmp"),
+    ("ico", "image/x-icon"),
+    ("tiff", "image/tiff"),
+    ("pdf", "application/pdf"),
+];
+
+/// Extension to store an upload of MIME type `mime` under, `None` if it is not accepted.
+pub fn ext_for_mime(mime: &str) -> Option<&'static str> {
+    let mime = mime.split(';').next().unwrap_or_default().trim();
+    match mime.to_ascii_lowercase().as_str() {
+        "image/jpg" => Some("jpg"),
+        "image/vnd.microsoft.icon" => Some("ico"),
+        mime => TYPES.iter().find(|(_, m)| *m == mime).map(|(ext, _)| *ext),
+    }
 }
 
-pub fn is_pdf_ext(ext: Option<&str>) -> bool {
-    matches!(ext.map(|s| s.to_ascii_lowercase()).as_deref(), Some("pdf"))
-}
-
-/// MIME type of an asset uploaded from the pad editor, from its extension or, lacking one, from
-/// the magic bytes of the binary formats the editor accepts. Must only be used for entries
-/// stored as assets: text pastes are always served as plain text.
-pub fn asset_mime(bytes: &[u8], ext: Option<&str>) -> &'static str {
-    if let Some(ext) = ext {
-        return match ext.to_ascii_lowercase().as_str() {
-            "png" => "image/png",
-            "jpg" | "jpeg" => "image/jpeg",
-            "gif" => "image/gif",
-            "webp" => "image/webp",
-            "svg" => "image/svg+xml",
-            "avif" => "image/avif",
-            "bmp" => "image/bmp",
-            "ico" => "image/x-icon",
-            "tiff" | "tif" => "image/tiff",
-            "pdf" => "application/pdf",
-            _ => "application/octet-stream",
-        };
-    }
-
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        "image/png"
-    } else if bytes.starts_with(b"\xff\xd8\xff") {
-        "image/jpeg"
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        "image/gif"
-    } else if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        "image/webp"
-    } else if bytes.starts_with(b"%PDF-") {
-        "application/pdf"
-    } else {
-        "application/octet-stream"
-    }
+/// MIME type of an asset with extension `ext`. Must only be used for entries stored as assets:
+/// text pastes are always served as plain text.
+pub fn asset_mime(ext: Option<&str>) -> &'static str {
+    let ext = ext.unwrap_or_default().to_ascii_lowercase();
+    let ext = match ext.as_str() {
+        "jpeg" => "jpg",
+        "tif" => "tiff",
+        ext => ext,
+    };
+    TYPES
+        .iter()
+        .find(|(e, _)| *e == ext)
+        .map_or("application/octet-stream", |(_, mime)| *mime)
 }
 
 pub fn format_size(bytes: usize) -> String {
@@ -61,56 +54,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_image_ext() {
-        assert!(is_image_ext(Some("png")));
-        assert!(is_image_ext(Some("jpg")));
-        assert!(is_image_ext(Some("jpeg")));
-        assert!(is_image_ext(Some("gif")));
-        assert!(is_image_ext(Some("webp")));
-        assert!(is_image_ext(Some("avif")));
-        assert!(is_image_ext(Some("bmp")));
-        assert!(is_image_ext(Some("ico")));
-        assert!(is_image_ext(Some("tiff")));
-        assert!(is_image_ext(Some("tif")));
-
-        // svg is not considered an image extension (it's text/code)
-        assert!(!is_image_ext(Some("svg")));
-        assert!(!is_image_ext(Some("html")));
-        assert!(!is_image_ext(Some("js")));
-        assert!(!is_image_ext(Some("rs")));
-        assert!(!is_image_ext(None));
+    fn mime_and_extension_round_trip() {
+        for (ext, mime) in TYPES {
+            assert_eq!(ext_for_mime(mime), Some(*ext));
+            assert_eq!(asset_mime(Some(ext)), *mime);
+        }
+        assert_eq!(ext_for_mime("IMAGE/JPG"), Some("jpg"));
+        assert_eq!(asset_mime(Some("JPEG")), "image/jpeg");
+        assert_eq!(asset_mime(Some("tif")), "image/tiff");
     }
 
     #[test]
-    fn asset_mime_from_extension() {
-        assert_eq!(asset_mime(b"", Some("png")), "image/png");
-        assert_eq!(asset_mime(b"", Some("JPG")), "image/jpeg");
-        assert_eq!(asset_mime(b"", Some("svg")), "image/svg+xml");
-        assert_eq!(asset_mime(b"", Some("tif")), "image/tiff");
-        assert_eq!(asset_mime(b"", Some("pdf")), "application/pdf");
+    fn rejects_other_types() {
+        assert_eq!(ext_for_mime("text/html"), None);
+        assert_eq!(ext_for_mime("application/javascript"), None);
         // Executable or rich text formats never get an executable MIME type.
-        assert_eq!(
-            asset_mime(b"<html>", Some("html")),
-            "application/octet-stream"
-        );
-        assert_eq!(
-            asset_mime(b"alert(1)", Some("js")),
-            "application/octet-stream"
-        );
-    }
-
-    #[test]
-    fn asset_mime_from_magic_bytes() {
-        assert_eq!(asset_mime(b"\x89PNG\r\n\x1a\nrest", None), "image/png");
-        assert_eq!(asset_mime(b"%PDF-1.4", None), "application/pdf");
-        // Text that merely starts like a bitmap or an SVG is not trusted.
-        assert_eq!(
-            asset_mime(b"BMW is a car", None),
-            "application/octet-stream"
-        );
-        assert_eq!(
-            asset_mime(b"<svg onload=alert(1)>", None),
-            "application/octet-stream"
-        );
+        assert_eq!(asset_mime(Some("html")), "application/octet-stream");
+        assert_eq!(asset_mime(Some("js")), "application/octet-stream");
+        assert_eq!(asset_mime(None), "application/octet-stream");
     }
 }

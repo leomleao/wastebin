@@ -97,12 +97,14 @@ impl Client {
     /// Upload an asset through the pad API and return its `/raw/` URL.
     pub(crate) async fn upload_asset(
         &self,
-        data_url: &str,
+        bytes: &'static [u8],
+        mime: &str,
         filename: &str,
     ) -> Result<String, Box<dyn std::error::Error>> {
         let res = self
-            .post("/api/asset")
-            .json(&serde_json::json!({ "data_url": data_url, "filename": filename }))
+            .post(&format!("/api/asset?filename={filename}"))
+            .header(reqwest::header::CONTENT_TYPE, mime)
+            .body(bytes)
             .send()
             .await?;
         assert_eq!(res.status(), reqwest::StatusCode::OK);

@@ -12,6 +12,8 @@
   data-i18n-offline="{{ lang.t("index.status.offline") }}"
   data-i18n-uploading="{{ lang.t("index.status.uploading") }}"
   data-i18n-deleted="{{ lang.t("index.status.deleted") }}"
+  data-i18n-too-large="{{ lang.t("index.status.too_large") }}"
+  data-i18n-conflict="{{ lang.t("index.status.conflict") }}"
   data-i18n-copied="{{ lang.t("paste.toast.copied_content") }}"
   data-i18n-copied-md="{{ lang.t("index.toast.copied_markdown") }}"
   data-i18n-copy-failed="{{ lang.t("index.toast.copy_failed") }}"
@@ -37,7 +39,7 @@
       </button>
       <button type="button" id="btn-preview" class="nav-button hidden" title="{{ lang.t("nav.rendered") }}" aria-label="{{ lang.t("nav.rendered") }}" aria-pressed="false" data-title-rendered="{{ lang.t("nav.rendered") }}" data-title-source="{{ lang.t("nav.source") }}">
         <span class="icon-rendered"><svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" stroke="none"><path d="M22.269 19.385H1.731A1.73 1.73 0 0 1 0 17.654V6.345a1.73 1.73 0 0 1 1.731-1.73h20.538A1.73 1.73 0 0 1 24 6.345v11.308a1.73 1.73 0 0 1-1.731 1.731zm-16.5-3.462v-4.5l2.308 2.885 2.307-2.885v4.5h2.308V8.078h-2.308l-2.307 2.885-2.308-2.885H3.46v7.847zM21.231 12h-2.308V8.077h-2.307V12h-2.308l3.461 4.039z"/></svg></span>
-        <span class="icon-source hidden"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/></svg></span>
+        <span class="icon-source"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/></svg></span>
       </button>
       <button type="button" id="btn-copy" class="nav-button" title="{{ lang.t("nav.copy") }}" aria-label="{{ lang.t("nav.copy") }}">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M8 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h4"/><path d="M16 4h2a2 2 0 0 1 2 2v2"/><path d="M21 14H11"/><path d="m15 10-4 4 4 4"/></svg>

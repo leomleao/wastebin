@@ -18,20 +18,20 @@ const titleInput = $("title");
 const langSelect = $("langs");
 const langFilter = $("filter");
 const padList = $("pad-list");
+const padActions = $("pad-actions");
 const btnPreview = $("btn-preview");
 const btnDownload = $("btn-download");
 const btnRaw = $("btn-raw");
-const btnDelete = $("btn-delete");
-const padActions = $("pad-actions");
 
 // Localized strings, passed in as `data-i18n-*` attributes.
 function t(key) {
   return root.dataset["i18n" + key] || "";
 }
 
-const clientId = Math.random().toString(36).slice(2) + Date.now().toString(36);
 const SAVE_DELAY_MS = 250;
+const HIGHLIGHT_DELAY_MS = 800;
 const PAD_LIST_DELAY_MS = 5000;
+const MAX_RETRY_DELAY_MS = 30000;
 
 const state = {
   padId: null,
@@ -42,10 +42,10 @@ const state = {
   lang: "auto",
   // Extension the server detected for "auto".
   detected: "txt",
-  // Content and extension the server last acknowledged for this pad.
+  // Content and extension the server last acknowledged, and its revision. Revisions of the
+  // same pad compare in order.
   lastSaved: null,
   lastSavedExt: null,
-  // Server revision `lastSaved` belongs to; writes based on an older one are refused.
   revision: null,
   titleDirty: false,
   expiryDirty: false,
@@ -54,15 +54,14 @@ const state = {
   saving: false,
   pending: false,
   saveTimer: null,
+  retryDelay: 0,
   // Bumped whenever another pad is shown, so that late responses for the old one are dropped.
   generation: 0,
   // Highlighted HTML of each line the server highlighted last, keyed by the line's text.
   rows: new Map(),
 };
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+// == Helpers
 
 function escapeHtml(text) {
   return text
@@ -76,7 +75,6 @@ function escapeHtml(text) {
 let toastTimer = null;
 function showToast(text) {
   const toast = $("toast");
-  if (!toast) return;
   toast.textContent = text;
   toast.classList.remove("hidden");
   clearTimeout(toastTimer);
@@ -106,7 +104,6 @@ function writeClipboardText(text) {
   // `navigator.clipboard` only exists in secure contexts, i.e. not on plain-HTTP LAN hosts.
   const helper = document.createElement("textarea");
   helper.value = text;
-  helper.setAttribute("readonly", "");
   helper.className = "clipboard-helper";
   document.body.appendChild(helper);
   helper.select();
@@ -115,9 +112,17 @@ function writeClipboardText(text) {
   return ok ? Promise.resolve() : Promise.reject(new Error("copy failed"));
 }
 
-// ---------------------------------------------------------------------------
-// Sanitizer for document HTML: pasted, loaded from the server or received live.
-// ---------------------------------------------------------------------------
+async function fetchPad(id) {
+  try {
+    const resp = await fetch("/api/pad/" + encodeURIComponent(id));
+    return resp.ok ? await resp.json() : null;
+  } catch (err) {
+    console.error(err);
+    return null;
+  }
+}
+
+// == Sanitizer for document HTML: pasted, loaded from the server or received live.
 
 const ALLOWED_TAGS = new Set([
   "H1", "H2", "H3", "H4", "H5", "H6", "P", "DIV", "BR", "HR",
@@ -131,12 +136,8 @@ const DROPPED_TAGS = new Set([
   "TEMPLATE", "SVG", "MATH", "FORM", "INPUT", "BUTTON", "SELECT", "TEXTAREA", "NOSCRIPT",
 ]);
 
-function isSafeHref(href) {
-  return /^(?:https?:|mailto:|\/(?!\/)|#)/i.test(href.trim());
-}
-
 function isAssetUrl(url) {
-  return /^\/raw\/[A-Za-z0-9_-]+(?:\.[A-Za-z0-9]+)?$/.test(url);
+  return /^\/raw\/[A-Za-z0-9_+-]+(?:\.[A-Za-z0-9]+)?$/.test(url);
 }
 
 function sanitizeNode(node, out) {
@@ -161,25 +162,18 @@ function sanitizeNode(node, out) {
 
     if (name === "a") {
       const href = child.getAttribute("href") || "";
-      if (isSafeHref(href)) el.setAttribute("href", href);
+      if (/^(?:https?:|mailto:|\/(?!\/)|#)/i.test(href.trim())) el.setAttribute("href", href);
     } else if (name === "img") {
       const src = child.getAttribute("src") || "";
-      if (!isAssetUrl(src) && !/^data:image\//i.test(src)) continue;
+      if (!isAssetUrl(src)) continue;
       el.setAttribute("src", src);
       el.setAttribute("alt", child.getAttribute("alt") || "");
-    } else if (name === "figure") {
-      if (child.classList.contains("inline-asset")) {
-        el.className = "inline-asset";
-        const kind = child.getAttribute("data-kind");
-        if (kind === "image" || kind === "pdf") el.setAttribute("data-kind", kind);
-        const src = child.getAttribute("data-src") || "";
-        if (isAssetUrl(src)) el.setAttribute("data-src", src);
-      }
-    } else if (name === "td" || name === "th") {
-      for (const attr of ["colspan", "rowspan"]) {
-        const value = child.getAttribute(attr);
-        if (value && /^\d{1,3}$/.test(value)) el.setAttribute(attr, value);
-      }
+    } else if (name === "figure" && child.classList.contains("inline-asset")) {
+      el.className = "inline-asset";
+      const kind = child.getAttribute("data-kind");
+      if (kind === "image" || kind === "pdf") el.setAttribute("data-kind", kind);
+      const src = child.getAttribute("data-src") || "";
+      if (isAssetUrl(src)) el.setAttribute("data-src", src);
     }
 
     sanitizeNode(child, el);
@@ -193,9 +187,7 @@ function sanitizeHtml(html) {
   return sanitizeNode(doc.body, document.createElement("div"));
 }
 
-// ---------------------------------------------------------------------------
-// Code editor: textarea over a highlighted copy, with a soft-wrap aware gutter.
-// ---------------------------------------------------------------------------
+// == Code editor: textarea over a highlighted copy, with a soft-wrap aware gutter.
 
 const mirror = document.createElement("div");
 mirror.id = "line-mirror";
@@ -300,15 +292,14 @@ function setHighlightRows(content, highlightedHtml) {
   if (!highlightedHtml) return;
 
   const doc = new DOMParser().parseFromString(highlightedHtml, "text/html");
-  const rows = doc.querySelectorAll('.src-code [id^="LC"]');
   const lines = content.split("\n");
-  rows.forEach((row, i) => {
+  doc.querySelectorAll('.src-code [id^="LC"]').forEach((row, i) => {
     if (i < lines.length) state.rows.set(lines[i], row.innerHTML);
   });
 }
 
 // Lines the server highlighted keep their colors while typing; edited lines show
-// plain until the next save returns.
+// plain until the editor is idle and their highlighting is fetched.
 function renderHighlight() {
   const lines = textarea.value.split("\n");
   let html = lines.map((line) => state.rows.get(line) ?? escapeHtml(line)).join("\n");
@@ -323,9 +314,21 @@ function renderCode() {
   updateStats();
 }
 
-// ---------------------------------------------------------------------------
-// Document editor
-// ---------------------------------------------------------------------------
+let highlightTimer = null;
+function scheduleHighlight() {
+  clearTimeout(highlightTimer);
+  if (state.mode !== "code" || !state.padId) return;
+  highlightTimer = setTimeout(async () => {
+    if (hasUnsavedChanges()) return;
+    const pad = await fetchPad(state.padId);
+    if (pad && pad.content === textarea.value && state.mode === "code") {
+      setHighlightRows(pad.content, pad.highlighted_html);
+      renderHighlight();
+    }
+  }, HIGHLIGHT_DELAY_MS);
+}
+
+// == Document editor
 
 const BLOCK_TAGS = new Set([
   "DIV", "P", "H1", "H2", "H3", "H4", "H5", "H6", "LI", "TR", "PRE", "BLOCKQUOTE",
@@ -387,12 +390,11 @@ function hydrateAssets(node) {
     if (caption && !caption.querySelector(".asset-remove")) {
       const wrap = document.createElement("span");
       wrap.className = "editor-only";
-      wrap.append(" · ");
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "asset-remove";
       remove.textContent = t("AssetRemove");
-      wrap.appendChild(remove);
+      wrap.append(" · ", remove);
       caption.appendChild(wrap);
     }
   }
@@ -410,19 +412,16 @@ function serializeDoc() {
 }
 
 function figureHtml(asset) {
-  const isPdf = asset.is_pdf;
-  const name = escapeHtml(asset.filename || "");
+  const name = escapeHtml(asset.filename);
   const url = escapeHtml(asset.url);
-  const dl = escapeHtml(asset.dl_url);
-  const links = isPdf
-    ? '<a href="' + url + '">' + escapeHtml(t("AssetOpen")) + "</a> · " +
-      '<a href="' + dl + '">' + escapeHtml(t("AssetDownload")) + "</a>"
-    : '<a href="' + dl + '">' + escapeHtml(t("AssetDownload")) + "</a>";
-  const media = isPdf ? "" : '<img src="' + url + '" alt="' + name + '">';
-  return '<figure class="inline-asset" data-kind="' + (isPdf ? "pdf" : "image") + '"' +
-    (isPdf ? ' data-src="' + url + '"' : "") + ">" + media +
-    "<figcaption>" + name + " · " + escapeHtml(asset.size_formatted || "") + " · " + links +
-    "</figcaption></figure>";
+  const dl = '<a href="' + escapeHtml(asset.dl_url) + '">' + escapeHtml(t("AssetDownload")) + "</a>";
+  const caption = "<figcaption>" + name + " · " + escapeHtml(asset.size_formatted) + " · ";
+  if (asset.is_pdf) {
+    return '<figure class="inline-asset" data-kind="pdf" data-src="' + url + '">' + caption +
+      '<a href="' + url + '">' + escapeHtml(t("AssetOpen")) + "</a> · " + dl + "</figcaption></figure>";
+  }
+  return '<figure class="inline-asset" data-kind="image"><img src="' + url + '" alt="' + name +
+    '">' + caption + dl + "</figcaption></figure>";
 }
 
 // Character offset of the caret in the document's text, to restore it after a remote update.
@@ -439,71 +438,45 @@ function restoreDocCaret(offset) {
   if (offset === null) return;
   const walker = document.createTreeWalker(docEditor, NodeFilter.SHOW_TEXT);
   let remaining = offset;
-  let node = walker.nextNode();
-  while (node) {
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
     if (remaining <= node.nodeValue.length) {
-      const selection = window.getSelection();
-      selection.collapse(node, remaining);
+      window.getSelection().collapse(node, remaining);
       return;
     }
     remaining -= node.nodeValue.length;
-    node = walker.nextNode();
   }
 }
 
-// Where the next inline asset goes: the caret, or the end of the document.
-function captureInsertRange() {
-  const selection = window.getSelection();
-  if (selection.rangeCount && docEditor.contains(selection.getRangeAt(0).commonAncestorContainer)) {
-    return selection.getRangeAt(0).cloneRange();
-  }
-  const range = document.createRange();
-  range.selectNodeContents(docEditor);
-  range.collapse(false);
-  return range;
-}
-
-function insertNodesAt(range, html) {
+// Inline assets are blocks: insert them after the line holding the caret (replacing it when
+// empty), followed by an empty line to keep typing in.
+function insertBlocks(html) {
   const holder = document.createElement("div");
   holder.innerHTML = html;
   hydrateAssets(holder);
   const nodes = Array.from(holder.childNodes);
-  if (nodes.length === 0) return;
+  const selection = window.getSelection();
 
-  // Inline assets are blocks: split them out of the current line.
-  let container = range.startContainer;
-  while (container && container !== docEditor && container.parentNode !== docEditor) {
-    container = container.parentNode;
-  }
-
-  range.deleteContents();
-  const fragment = document.createDocumentFragment();
-  nodes.forEach((node) => fragment.appendChild(node));
-  const inLine = container && container !== docEditor && container.tagName !== "FIGURE";
-  if (inLine && container.nodeType === Node.ELEMENT_NODE && !docHasContent(container)) {
-    // An empty line becomes the asset.
-    container.replaceWith(fragment);
-  } else if (inLine) {
-    container.after(fragment);
+  let line = selection.rangeCount && docEditor.contains(selection.anchorNode) ? selection.anchorNode : null;
+  while (line && line.parentNode !== docEditor) line = line.parentNode;
+  if (line && line.nodeType === Node.ELEMENT_NODE && line.tagName !== "FIGURE" && !docHasContent(line)) {
+    line.replaceWith(...nodes);
+  } else if (line) {
+    line.after(...nodes);
   } else {
-    range.insertNode(fragment);
+    docEditor.append(...nodes);
   }
 
-  // Leave an empty line after the asset to keep typing in.
   const last = nodes[nodes.length - 1];
   let next = last.nextSibling;
   if (!next || next.nodeName === "FIGURE") {
     next = document.createElement("div");
-    next.appendChild(document.createElement("br"));
+    next.append(document.createElement("br"));
     last.after(next);
   }
-  const selection = window.getSelection();
   selection.collapse(next, 0);
 }
 
-// ---------------------------------------------------------------------------
-// Modes and views
-// ---------------------------------------------------------------------------
+// == Modes and views
 
 function effectiveLang() {
   if (state.mode === "doc") return "rich";
@@ -525,8 +498,6 @@ function updateView() {
   const title = previewing ? btnPreview.dataset.titleSource : btnPreview.dataset.titleRendered;
   btnPreview.title = title;
   btnPreview.setAttribute("aria-label", title);
-  btnPreview.querySelector(".icon-rendered").classList.toggle("hidden", previewing);
-  btnPreview.querySelector(".icon-source").classList.toggle("hidden", !previewing);
 }
 
 function setMode(mode) {
@@ -569,36 +540,32 @@ function selectLang(value) {
 }
 
 function updateAutoLabel() {
-  const auto = langSelect.options[0];
   const detected = state.mode === "code" && state.lang === "auto" && state.detected !== "txt";
-  auto.textContent = detected ? t("Auto") + " · " + state.detected : t("Auto");
+  const option = Array.from(langSelect.options).find((o) => o.index > 1 && o.value === state.detected);
+  langSelect.options[0].textContent = detected
+    ? t("Auto") + " · " + (option ? option.textContent : state.detected)
+    : t("Auto");
 }
 
-// ---------------------------------------------------------------------------
-// Stats
-// ---------------------------------------------------------------------------
+// == Stats
 
 const stats = $("stats");
 const MAX_BYTES = parseInt(stats.dataset.maxBytes, 10) || 1024 * 1024;
 const UNIT_KB = stats.dataset.unitKb;
 const UNIT_MB = stats.dataset.unitMb;
-const LABEL_LIMIT = stats.dataset.labelLimit;
 
 function formatSize(bytes) {
   if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + " " + UNIT_MB;
   return (bytes / 1024).toFixed(0) + " " + UNIT_KB;
 }
 
-$("progress-limit").textContent = LABEL_LIMIT + " " + formatSize(MAX_BYTES);
+$("progress-limit").textContent = stats.dataset.labelLimit + " " + formatSize(MAX_BYTES);
 
 function updateStats() {
   const text = state.mode === "doc" ? docText(docEditor) : textarea.value;
-  const content = state.mode === "doc" ? serializeDoc() : text;
-  const lines = Math.max(1, text.split("\n").length);
-  let bytes;
-  try { bytes = new Blob([content]).size; } catch (_) { bytes = content.length; }
+  const bytes = new Blob([currentContent()]).size;
 
-  $("stat-lines").textContent = lines;
+  $("stat-lines").textContent = Math.max(1, text.split("\n").length);
   $("stat-chars").textContent = text.length;
   $("stat-bytes").textContent = bytes.toLocaleString();
 
@@ -609,28 +576,26 @@ function updateStats() {
   $("progress-kb").textContent = (bytes / 1024).toFixed(1) + " " + UNIT_KB;
 }
 
-// ---------------------------------------------------------------------------
-// Pad metadata in the panel
-// ---------------------------------------------------------------------------
+// == Pad metadata in the panel
 
-const defaultExpiry = document.querySelector('#expiry-list input[name="expires"]:checked');
+const expiryRadios = Array.from(document.querySelectorAll('#expiry-list input[name="expires"]'));
+const defaultExpiry = expiryRadios.find((radio) => radio.checked);
 
 function selectedExpiry() {
-  const checked = document.querySelector('#expiry-list input[name="expires"]:checked');
+  const checked = expiryRadios.find((radio) => radio.checked);
   return checked ? parseInt(checked.value, 10) : 0;
 }
 
 // Show the current pad's expiration as the shortest option that still covers it.
 function syncExpiryRadios() {
   if (!state.padId) return;
-  const radios = Array.from(document.querySelectorAll('#expiry-list input[name="expires"]'));
   const remaining = state.expiresIn;
   const match = remaining === null
-    ? radios.find((radio) => radio.value === "0")
-    : radios
+    ? expiryRadios.find((radio) => radio.value === "0")
+    : expiryRadios
       .filter((radio) => radio.value !== "0" && parseInt(radio.value, 10) >= remaining)
       .sort((a, b) => parseInt(a.value, 10) - parseInt(b.value, 10))[0];
-  for (const radio of radios) radio.checked = radio === match;
+  for (const radio of expiryRadios) radio.checked = radio === match;
 }
 
 function updatePadActions() {
@@ -640,6 +605,18 @@ function updatePadActions() {
   for (const item of padList.querySelectorAll(".pad-item")) {
     item.classList.toggle("active", item.dataset.id === state.padId);
   }
+}
+
+// Label of the current pad in the pad list: its first line of text without Markdown markers,
+// or the name of its first image or PDF.
+function padLabel() {
+  const text = state.mode === "doc" ? docText(docEditor) : textarea.value;
+  const line = text.split("\n").find((l) => l.trim());
+  if (line) {
+    return line.trim().replace(/^(?:#{1,6}\s+|[-*+]\s+(?:\[[ xX]\]\s+)?|>\s*|\d+[.)]\s+)/, "");
+  }
+  const caption = state.mode === "doc" && docEditor.querySelector("figure figcaption");
+  return caption ? caption.firstChild.textContent.split(" · ")[0] : "";
 }
 
 function relativeTime(iso) {
@@ -656,7 +633,6 @@ function relativeTime(iso) {
 }
 
 function renderPads(pads) {
-  if (!Array.isArray(pads)) return;
   if (pads.length === 0) {
     const empty = document.createElement("div");
     empty.className = "pad-empty";
@@ -670,7 +646,6 @@ function renderPads(pads) {
     item.type = "button";
     item.className = "pad-item";
     item.dataset.id = pad.id;
-    item.dataset.updated = pad.updated_at || "";
     const label = document.createElement("span");
     label.className = "pad-label";
     label.textContent = pad.title || pad.preview || t("Untitled");
@@ -703,15 +678,7 @@ function refreshPadsSoon() {
   }
 }
 
-setInterval(() => {
-  for (const time of padList.querySelectorAll(".pad-item")) {
-    time.querySelector(".pad-time").textContent = relativeTime(time.dataset.updated);
-  }
-}, 60000);
-
-// ---------------------------------------------------------------------------
-// Loading and saving
-// ---------------------------------------------------------------------------
+// == Saving
 
 function currentContent() {
   return state.mode === "doc" ? serializeDoc() : textarea.value;
@@ -734,6 +701,13 @@ function scheduleSave(immediate) {
     return;
   }
   state.saveTimer = setTimeout(saveNow, SAVE_DELAY_MS);
+}
+
+// Try a failed save again, waiting longer each time.
+function scheduleRetry() {
+  state.retryDelay = Math.min(MAX_RETRY_DELAY_MS, state.retryDelay * 2 || 1000);
+  clearTimeout(state.saveTimer);
+  state.saveTimer = setTimeout(saveNow, state.retryDelay);
 }
 
 function onLocalEdit(immediate) {
@@ -764,16 +738,21 @@ async function saveNow() {
     return;
   }
 
-  const body = { content, extension, client_id: clientId };
-  if (!isCreate) body.base_revision = state.revision;
-  const sentTitle = isCreate ? titleInput.value.trim() !== "" : state.titleDirty;
+  const body = { content, extension, preview: padLabel() };
+  const sentTitle = state.titleDirty;
   const sentExpiry = isCreate || state.expiryDirty;
   if (sentTitle) body.title = titleInput.value;
   if (sentExpiry) body.expires = selectedExpiry();
+  if (!isCreate) body.base_revision = state.revision;
   state.titleDirty = false;
   state.expiryDirty = false;
+  const keepDirty = () => {
+    state.titleDirty = state.titleDirty || sentTitle;
+    state.expiryDirty = state.expiryDirty || (sentExpiry && !isCreate);
+  };
 
   const generation = state.generation;
+  let retry = false;
   state.saving = true;
   setStatus(t("Saving"));
 
@@ -783,23 +762,22 @@ async function saveNow() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-
     if (generation !== state.generation) return;
 
     if (resp.status === 409) {
-      // Someone else saved first: replay this edit on top of their version and save again.
+      // Someone else saved first.
+      keepDirty();
       rebase(content, await resp.json());
-      state.titleDirty = state.titleDirty || sentTitle;
-      state.expiryDirty = state.expiryDirty || sentExpiry;
-      state.pending = true;
       return;
     }
     if (resp.status === 404 && !isCreate) {
-      // The pad was deleted or expired elsewhere: keep the text as a new pad.
-      state.padId = null;
-      state.lastSaved = null;
-      state.titleDirty = titleInput.value.trim() !== "";
+      detachPad();
       state.pending = true;
+      return;
+    }
+    if (resp.status === 413) {
+      keepDirty();
+      setStatus(t("TooLarge"));
       return;
     }
     if (!resp.ok) throw new Error("save failed: " + resp.status);
@@ -815,14 +793,12 @@ async function saveNow() {
     state.lastSavedExt = extension;
     state.revision = pad.revision;
     state.expiresIn = pad.expires_in ?? null;
+    state.retryDelay = 0;
 
     if (state.mode === "code") {
       state.detected = pad.extension;
-      if (pad.content === textarea.value || !hasUnsavedChanges()) {
-        setHighlightRows(pad.content, pad.highlighted_html);
-        renderHighlight();
-      }
       updateAutoLabel();
+      scheduleHighlight();
     }
 
     syncExpiryRadios();
@@ -838,20 +814,22 @@ async function saveNow() {
   } catch (err) {
     console.error(err);
     if (generation === state.generation) {
-      state.titleDirty = state.titleDirty || sentTitle;
-      state.expiryDirty = state.expiryDirty || (sentExpiry && !isCreate);
+      keepDirty();
       setStatus(t("Offline"));
+      retry = true;
     }
   } finally {
     state.saving = false;
-    if (state.pending) {
+    if (retry) {
+      scheduleRetry();
+    } else if (state.pending) {
       state.pending = false;
       saveNow();
     }
   }
 }
 
-// Wait until everything typed so far reached the server.
+// Wait until everything typed so far reached the server, or gave up trying.
 async function flushSave() {
   for (let i = 0; i < 100 && (state.saveTimer !== null || state.saving || state.pending); i++) {
     if (state.saving) {
@@ -859,108 +837,6 @@ async function flushSave() {
     } else {
       await saveNow();
     }
-  }
-}
-
-function resetEditor() {
-  clearTimeout(state.saveTimer);
-  state.saveTimer = null;
-  state.pending = false;
-  state.generation++;
-  state.padId = null;
-  state.previewing = false;
-  state.lang = "auto";
-  state.detected = "txt";
-  state.lastSaved = null;
-  state.lastSavedExt = null;
-  state.revision = null;
-  state.titleDirty = false;
-  state.expiryDirty = false;
-  state.expiresIn = null;
-  state.rows = new Map();
-
-  textarea.value = "";
-  codeHighlight.replaceChildren();
-  docEditor.replaceChildren();
-  mdPreview.replaceChildren();
-  titleInput.value = "";
-  if (defaultExpiry) defaultExpiry.checked = true;
-  langFilter.value = "";
-  filterLangs();
-  selectLang("auto");
-  updateAutoLabel();
-  setMode("code");
-  syncExpiryRadios();
-  updatePadActions();
-  setStatus("");
-}
-
-function newPad() {
-  resetEditor();
-  history.pushState(null, "", "/new");
-  textarea.focus();
-}
-
-function isDocument(pad) {
-  return pad.extension === "rich" ||
-    (pad.extension === "html" && /<(?:figure|img|table|p)[\s>]/i.test(pad.content));
-}
-
-// Show `pad` in the editor. For live updates the caret and scroll position are kept.
-function applyPad(pad, live) {
-  const scrollTop = editorWrap.scrollTop;
-
-  state.padId = pad.id;
-  state.lastSaved = pad.content;
-  state.revision = pad.revision;
-  state.expiresIn = pad.expires_in ?? null;
-  if (!live || document.activeElement !== titleInput) {
-    titleInput.value = pad.title || "";
-    state.titleDirty = false;
-  }
-
-  if (isDocument(pad)) {
-    state.lang = "rich";
-    state.lastSavedExt = "rich";
-    selectLang("rich");
-    const caret = live ? docCaretOffset() : null;
-    if (state.mode !== "doc" || serializeDoc() !== sanitizeHtml(pad.content).innerHTML) {
-      setDocHtml(pad.content);
-      // The sanitized form is what this editor sends back.
-      state.lastSaved = serializeDoc();
-    }
-    setMode("doc");
-    restoreDocCaret(caret);
-  } else {
-    if (!live) {
-      state.lang = pad.auto_detected ? "auto" : pad.extension;
-    } else if (state.lang !== "auto") {
-      state.lang = pad.extension;
-    }
-    state.lastSavedExt = state.lang;
-    state.detected = pad.extension;
-    selectLang(state.lang);
-
-    const before = textarea.value;
-    const focused = document.activeElement === textarea;
-    const [start, end] = [textarea.selectionStart, textarea.selectionEnd];
-    textarea.value = pad.content;
-    setHighlightRows(pad.content, pad.highlighted_html);
-    setMode("code");
-
-    if (live && focused) {
-      textarea.setSelectionRange(shiftOffset(before, pad.content, start),
-        shiftOffset(before, pad.content, end));
-    }
-  }
-
-  updateAutoLabel();
-  syncExpiryRadios();
-  updatePadActions();
-  updateView();
-  if (live) {
-    editorWrap.scrollTop = scrollTop;
-    if (state.previewing) renderPreview();
   }
 }
 
@@ -987,82 +863,162 @@ function shiftOffset(before, after, offset) {
 
 // Three-way merge of two edits of `base` that touch separate regions, or `null`.
 function merge(base, mine, theirs) {
-  const m = changedRegion(base, mine);
-  const t = changedRegion(base, theirs);
-  const inserted = mine.slice(m.start, m.endAfter);
-  if (m.endBefore <= t.start) {
-    return theirs.slice(0, m.start) + inserted + theirs.slice(m.endBefore);
+  const ours = changedRegion(base, mine);
+  const other = changedRegion(base, theirs);
+  const inserted = mine.slice(ours.start, ours.endAfter);
+  if (ours.endBefore <= other.start) {
+    return theirs.slice(0, ours.start) + inserted + theirs.slice(ours.endBefore);
   }
-  if (t.endBefore <= m.start) {
+  if (other.endBefore <= ours.start) {
     const delta = theirs.length - base.length;
-    return theirs.slice(0, m.start + delta) + inserted + theirs.slice(m.endBefore + delta);
+    return theirs.slice(0, ours.start + delta) + inserted + theirs.slice(ours.endBefore + delta);
   }
   return null;
 }
 
-// Replay the local edit `mine` (made on top of `state.lastSaved`) onto the newer `pad`. When
-// both touched the same region the local version wins, as it is the one being typed.
+// Replay the local edit `mine` (made on top of `state.lastSaved`) onto the newer `pad` and
+// save again. When both changed the same text, nothing is overwritten: the editor shows the
+// newer pad and says so.
 function rebase(mine, pad) {
-  const merged = merge(state.lastSaved ?? "", mine, pad.content) ?? mine;
+  const current = currentContent();
+  const merged = merge(state.lastSaved ?? "", mine, pad.content);
+  // Keep anything typed while the request was in flight.
+  const result = merged === null || current === mine ? merged : merge(mine, current, merged);
+
+  if (result === null) {
+    applyPad(pad, true);
+    setStatus(t("Conflict"));
+    return;
+  }
+
   state.lastSaved = pad.content;
   state.revision = pad.revision;
-  const current = currentContent();
-  // Keep anything typed while the request was in flight.
-  const result = current === mine ? merged : merge(mine, current, merged) ?? current;
-  if (result === current) return;
+  if (result !== current) setContent(result);
+  state.pending = true;
+}
 
+// The open pad was deleted or expired elsewhere: keep the text, which saves as a new pad.
+function detachPad() {
+  Object.assign(state, { padId: null, lastSaved: null, revision: null });
+  state.titleDirty = titleInput.value.trim() !== "";
+  updatePadActions();
+  updateView();
+}
+
+// Replace the text of the current editor, keeping the caret where it was relative to the text.
+function setContent(text) {
   if (state.mode === "doc") {
     const caret = docCaretOffset();
-    setDocHtml(result);
+    setDocHtml(text);
     restoreDocCaret(caret);
-  } else {
-    const [start, end] = [textarea.selectionStart, textarea.selectionEnd];
-    textarea.value = result;
-    textarea.setSelectionRange(shiftOffset(current, result, start), shiftOffset(current, result, end));
-    renderCode();
+    return;
+  }
+  const [before, start, end] = [textarea.value, textarea.selectionStart, textarea.selectionEnd];
+  const focused = document.activeElement === textarea;
+  textarea.value = text;
+  if (focused) textarea.setSelectionRange(shiftOffset(before, text, start), shiftOffset(before, text, end));
+  renderCode();
+}
+
+// == Loading
+
+function resetEditor() {
+  clearTimeout(state.saveTimer);
+  state.saveTimer = null;
+  state.pending = false;
+  state.generation++;
+  Object.assign(state, {
+    padId: null,
+    previewing: false,
+    lang: "auto",
+    detected: "txt",
+    lastSaved: null,
+    lastSavedExt: null,
+    revision: null,
+    titleDirty: false,
+    expiryDirty: false,
+    expiresIn: null,
+    retryDelay: 0,
+    rows: new Map(),
+  });
+
+  textarea.value = "";
+  codeHighlight.replaceChildren();
+  docEditor.replaceChildren();
+  mdPreview.replaceChildren();
+  titleInput.value = "";
+  if (defaultExpiry) defaultExpiry.checked = true;
+  langFilter.value = "";
+  filterLangs();
+  selectLang("auto");
+  updateAutoLabel();
+  setMode("code");
+  updatePadActions();
+  setStatus("");
+}
+
+function newPad() {
+  resetEditor();
+  history.pushState(null, "", "/new");
+  textarea.focus();
+}
+
+// Show `pad` in the editor. For live updates the caret and scroll position are kept.
+function applyPad(pad, live) {
+  const scrollTop = editorWrap.scrollTop;
+  const content = pad.content ?? "";
+
+  state.padId = pad.id;
+  state.lastSaved = content;
+  state.revision = pad.revision;
+  state.expiresIn = pad.expires_in ?? null;
+  if (!live || document.activeElement !== titleInput) {
+    titleInput.value = pad.title || "";
+    state.titleDirty = false;
+  }
+
+  if (pad.extension === "rich") {
+    state.lang = "rich";
+  } else if (!live || state.lang !== "auto") {
+    state.lang = !live && pad.auto_detected ? "auto" : pad.extension;
+    state.detected = pad.extension;
+  }
+  state.lastSavedExt = state.lang;
+  selectLang(state.lang);
+  setHighlightRows(content, pad.highlighted_html);
+  const mode = pad.extension === "rich" ? "doc" : "code";
+  if (state.mode !== mode) {
+    textarea.value = "";
+    docEditor.replaceChildren();
+  }
+  setMode(mode);
+  setContent(content);
+  // The sanitized form is what this editor sends back.
+  if (mode === "doc") state.lastSaved = serializeDoc();
+
+  updateAutoLabel();
+  syncExpiryRadios();
+  updatePadActions();
+  updateView();
+  if (live) {
+    editorWrap.scrollTop = scrollTop;
+    if (state.previewing) renderPreview();
   }
 }
 
+// Open pad `id`, or the most recently changed one.
 async function openPad(id, push) {
   await flushSave();
   resetEditor();
   const generation = state.generation;
-  try {
-    const resp = await fetch("/api/pad/" + encodeURIComponent(id));
-    if (generation !== state.generation) return;
-    if (!resp.ok) {
-      history.replaceState(null, "", "/new");
-      return;
-    }
-    const pad = await resp.json();
-    if (generation !== state.generation) return;
-    applyPad(pad, false);
-    if (push) {
-      history.pushState(null, "", padUrl(pad.id));
-    } else {
-      history.replaceState(null, "", padUrl(pad.id));
-    }
-  } catch (err) {
-    console.error(err);
-    setStatus(t("Offline"));
+  const pad = id ? await fetchPad(id) : await fetch("/api/pad/latest").then((r) => r.json(), () => null);
+  if (generation !== state.generation) return;
+  if (!pad) {
+    if (id) history.replaceState(null, "", "/new");
+    return;
   }
-}
-
-async function openLatest() {
-  await flushSave();
-  resetEditor();
-  const generation = state.generation;
-  try {
-    const resp = await fetch("/api/pad/latest");
-    if (!resp.ok || generation !== state.generation) return;
-    const pad = await resp.json();
-    if (generation !== state.generation || !pad.id) return;
-    applyPad(pad, false);
-    history.replaceState(null, "", padUrl(pad.id));
-  } catch (err) {
-    console.error(err);
-    setStatus(t("Offline"));
-  }
+  applyPad(pad, false);
+  history[push ? "pushState" : "replaceState"](null, "", padUrl(pad.id));
 }
 
 function route() {
@@ -1072,18 +1028,15 @@ function route() {
     resetEditor();
     return Promise.resolve();
   }
-  return openLatest();
+  return openPad(null, false);
 }
 
+// The Markdown preview is the article of the pad's rendered view, sanitized by the server.
 async function renderPreview() {
-  await flushSave();
-  if (!state.padId) return;
   try {
-    const resp = await fetch("/api/pad/" + encodeURIComponent(state.padId) + "/md");
-    if (!resp.ok) throw new Error("render failed: " + resp.status);
-    const rendered = await resp.json();
-    // Rendered and sanitized by the server.
-    mdPreview.innerHTML = rendered.html;
+    const resp = await fetch("/md/" + encodeURIComponent(state.padId));
+    const doc = new DOMParser().parseFromString(await resp.text(), "text/html");
+    mdPreview.replaceChildren(...(doc.querySelector("article.markdown-body")?.childNodes || []));
   } catch (err) {
     console.error(err);
     setStatus(t("Offline"));
@@ -1091,21 +1044,32 @@ async function renderPreview() {
 }
 
 async function togglePreview() {
+  state.previewing = !state.previewing;
   if (state.previewing) {
-    state.previewing = false;
-    updateView();
+    await flushSave();
+    await renderPreview();
+  }
+  updateView();
+  if (!state.previewing) {
     renderCode();
     textarea.focus();
-    return;
   }
-  await renderPreview();
-  state.previewing = true;
-  updateView();
 }
 
-// ---------------------------------------------------------------------------
-// Live updates
-// ---------------------------------------------------------------------------
+// == Live updates: events only say which pad changed to which revision.
+
+async function syncRemote() {
+  // With local edits pending, the next save is refused and rebased instead.
+  if (!state.padId || hasUnsavedChanges()) return;
+  const generation = state.generation;
+  const pad = await fetchPad(state.padId);
+  if (!pad || generation !== state.generation || hasUnsavedChanges() ||
+      (state.revision && pad.revision <= state.revision)) {
+    return;
+  }
+  applyPad(pad, true);
+  setStatus(t("Live"));
+}
 
 function onPadEvent(event) {
   let msg;
@@ -1115,31 +1079,21 @@ function onPadEvent(event) {
     return;
   }
 
-  if (msg.type === "created" || msg.type === "deleted") {
-    refreshPads();
-  } else {
+  if (msg.type === "update") {
     refreshPadsSoon();
+  } else {
+    refreshPads();
   }
 
-  if (msg.client_id === clientId || !msg.id || msg.id !== state.padId) return;
+  if (!msg.id || msg.id !== state.padId) return;
 
   if (msg.type === "deleted") {
-    // Keep the text: the next edit saves it as a new pad.
-    state.padId = null;
-    state.lastSaved = null;
-    state.expiresIn = null;
-    syncExpiryRadios();
-    updatePadActions();
-    updateView();
+    detachPad();
     setStatus(t("Deleted"));
     return;
   }
 
-  // Never overwrite local edits that have not reached the server yet; the next save wins.
-  if (hasUnsavedChanges()) return;
-
-  applyPad(msg, true);
-  setStatus(t("Live"));
+  if (msg.revision && (!state.revision || msg.revision > state.revision)) syncRemote();
 }
 
 function connectEvents() {
@@ -1150,57 +1104,36 @@ function connectEvents() {
   events.addEventListener("error", () => {
     disconnected = true;
   });
-  events.addEventListener("open", async () => {
+  events.addEventListener("open", () => {
     if (!disconnected) return;
     disconnected = false;
-    // Catch up with what happened while the connection was down.
+    // Back online: catch up, and send what could not be saved meanwhile.
     refreshPads();
-    if (state.padId && !hasUnsavedChanges()) {
-      const generation = state.generation;
-      const resp = await fetch("/api/pad/" + encodeURIComponent(state.padId));
-      if (resp.ok && generation === state.generation && !hasUnsavedChanges()) {
-        applyPad(await resp.json(), true);
-      }
+    if (hasUnsavedChanges()) {
+      state.retryDelay = 0;
+      saveNow();
+    } else {
+      syncRemote();
     }
   });
 }
 
-// ---------------------------------------------------------------------------
-// Files, clipboard and drag & drop
-// ---------------------------------------------------------------------------
+window.addEventListener("beforeunload", (e) => {
+  if (hasUnsavedChanges()) e.preventDefault();
+});
+
+// == Files, clipboard and drag & drop
 
 function isMediaFile(file) {
-  return /^image\//.test(file.type) || file.type === "application/pdf" ||
-    /\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico|tiff?|pdf)$/i.test(file.name || "");
+  return file.type.startsWith("image/") || file.type === "application/pdf";
 }
 
-function readAsDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(file);
-  });
-}
-
-function screenshotName(file) {
-  const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
-  const d = new Date();
-  const pad = (n) => String(n).padStart(2, "0");
-  return "screenshot " + d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
-    " " + pad(d.getHours()) + "." + pad(d.getMinutes()) + "." + pad(d.getSeconds()) + "." + ext;
-}
-
-async function uploadDataUrl(dataUrl, filename) {
-  const resp = await fetch("/api/asset", {
+// Upload an image or PDF as is; it expires with the pad that shows it.
+async function upload(blob, filename) {
+  const resp = await fetch("/api/asset?filename=" + encodeURIComponent(filename), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      data_url: dataUrl,
-      filename,
-      // Assets live as long as the pad that shows them.
-      expires: state.padId ? Math.ceil(state.expiresIn ?? 0) : selectedExpiry(),
-    }),
+    headers: { "Content-Type": blob.type },
+    body: blob,
   });
   if (!resp.ok) throw new Error("upload failed: " + resp.status);
   return resp.json();
@@ -1208,62 +1141,30 @@ async function uploadDataUrl(dataUrl, filename) {
 
 async function insertAssets(files) {
   switchToDoc();
-  docEditor.focus();
-  let range = captureInsertRange();
-
   for (const file of files) {
     setStatus(t("Uploading"));
     try {
-      const asset = await uploadDataUrl(await readAsDataUrl(file), file.name || screenshotName(file));
-      if (!docEditor.contains(range.startContainer)) range = captureInsertRange();
-      insertNodesAt(range, figureHtml(asset));
-      range = captureInsertRange();
+      insertBlocks(figureHtml(await upload(file, file.name || "image")));
     } catch (err) {
       console.error(err);
       showToast(t("UploadFailed"));
     }
   }
-
   onLocalEdit(true);
 }
 
-// Pasted HTML can carry images as `data:` URLs: store them as assets first.
-async function cleanPastedHtml(html) {
-  const clean = sanitizeHtml(html);
-  for (const img of clean.querySelectorAll('img[src^="data:"]')) {
-    try {
-      const asset = await uploadDataUrl(img.getAttribute("src"), img.getAttribute("alt") || "image");
-      const holder = document.createElement("div");
-      holder.innerHTML = figureHtml(asset);
-      img.replaceWith(holder.firstChild);
-    } catch (err) {
-      console.error(err);
-      img.remove();
-    }
-  }
-  return clean.innerHTML;
-}
-
+// A text file opens as a new pad, in the language its extension names.
 async function loadTextFile(file) {
   const text = await file.text();
-  if (textarea.value || docHasContent(docEditor)) {
-    await flushSave();
-    newPad();
-  }
-  switchToCode();
+  await flushSave();
+  newPad();
   textarea.value = text.replace(/\n$/, "");
-
-  const dot = (file.name || "").lastIndexOf(".");
-  const ext = dot > 0 ? file.name.slice(dot + 1).toLowerCase() : "";
-  const known = Array.from(langSelect.options).some((option) => option.value === ext);
-  state.lang = known && ext !== "rich" ? ext : "auto";
+  const ext = (file.name.match(/\.([^.]+)$/) || [])[1] || "auto";
+  state.lang = ext !== "rich" && Array.from(langSelect.options).some((o) => o.value === ext) ? ext : "auto";
   selectLang(state.lang);
-  langFilter.value = "";
-  filterLangs();
-  if (!titleInput.value) titleInput.value = file.name || "";
-
+  titleInput.value = file.name;
+  state.titleDirty = true;
   renderCode();
-  updateAutoLabel();
   onLocalEdit(true);
 }
 
@@ -1279,29 +1180,13 @@ function clipboardFiles(clipboard) {
   return Array.from(clipboard.files || []).filter(isMediaFile);
 }
 
+// Images and PDFs pasted into the code editor start a document; text pastes natively.
 textarea.addEventListener("paste", async (e) => {
-  const clipboard = e.clipboardData;
-  if (!clipboard) return;
-
-  const files = clipboardFiles(clipboard);
-  if (files.length && !clipboard.getData("text/plain")) {
+  const files = e.clipboardData ? clipboardFiles(e.clipboardData) : [];
+  if (files.length && !e.clipboardData.getData("text/plain")) {
     e.preventDefault();
     await insertAssets(files);
-    return;
   }
-
-  // A document with images, tables or headings pasted into an empty pad starts a document.
-  const html = clipboard.getData("text/html");
-  if (html && state.lang === "auto" && textarea.value === "" &&
-      /<(?:img|table|h[1-6])[\s>]/i.test(html)) {
-    e.preventDefault();
-    switchToDoc();
-    docEditor.focus();
-    const clean = await cleanPastedHtml(html);
-    insertNodesAt(captureInsertRange(), clean);
-    onLocalEdit(true);
-  }
-  // Anything else is pasted as plain text by the browser.
 });
 
 docEditor.addEventListener("paste", async (e) => {
@@ -1316,17 +1201,7 @@ docEditor.addEventListener("paste", async (e) => {
   if (files.length && !text) {
     await insertAssets(files);
   } else if (html) {
-    const range = captureInsertRange();
-    const clean = await cleanPastedHtml(html);
-    if (/<figure/i.test(clean)) {
-      insertNodesAt(range, clean);
-    } else {
-      const selection = window.getSelection();
-      selection.removeAllRanges();
-      selection.addRange(range);
-      document.execCommand("insertHTML", false, clean);
-    }
-    onLocalEdit();
+    document.execCommand("insertHTML", false, sanitizeHtml(html).innerHTML);
   } else if (text) {
     // Inserted at the caret, replacing the selection, as part of the undo history.
     document.execCommand("insertText", false, text.replace(/\r\n?/g, "\n"));
@@ -1337,41 +1212,30 @@ docEditor.addEventListener("click", (e) => {
   const remove = e.target.closest(".asset-remove");
   if (!remove) return;
   e.preventDefault();
-  const figure = remove.closest("figure");
-  if (figure) figure.remove();
+  remove.closest("figure").remove();
   onLocalEdit(true);
 });
 
-let dragCounter = 0;
 const editorArea = editorWrap.parentElement;
 
 function isFileDrag(e) {
-  return e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files");
+  return Array.from(e.dataTransfer?.types || []).includes("Files");
 }
 
-editorArea.addEventListener("dragenter", (e) => {
+editorArea.addEventListener("dragover", (e) => {
   if (!isFileDrag(e)) return;
   e.preventDefault();
-  dragCounter++;
   overlay.classList.add("active");
 });
 
 editorArea.addEventListener("dragleave", (e) => {
-  if (!isFileDrag(e)) return;
-  e.preventDefault();
-  dragCounter = Math.max(0, dragCounter - 1);
-  if (dragCounter === 0) overlay.classList.remove("active");
-});
-
-editorArea.addEventListener("dragover", (e) => {
-  if (isFileDrag(e)) e.preventDefault();
+  if (!editorArea.contains(e.relatedTarget)) overlay.classList.remove("active");
 });
 
 editorArea.addEventListener("drop", (e) => {
+  overlay.classList.remove("active");
   if (!isFileDrag(e)) return;
   e.preventDefault();
-  dragCounter = 0;
-  overlay.classList.remove("active");
   handleFiles(e.dataTransfer.files);
 });
 
@@ -1383,30 +1247,12 @@ $("open").addEventListener("click", () => {
   input.click();
 });
 
-// ---------------------------------------------------------------------------
-// Copying
-// ---------------------------------------------------------------------------
+// == Copying
 
-function docForExport() {
-  const clone = sanitizeHtml(docEditor.innerHTML);
-  for (const img of clone.querySelectorAll("img[src]")) img.src = absoluteUrl(img.getAttribute("src"));
-  for (const a of clone.querySelectorAll("a[href]")) a.href = absoluteUrl(a.getAttribute("href"));
-  return clone;
-}
-
-async function copyContent() {
+async function copyText(text, toast) {
   try {
-    if (state.mode === "code") {
-      await writeClipboardText(textarea.value);
-    } else if (navigator.clipboard && window.ClipboardItem && window.isSecureContext) {
-      await navigator.clipboard.write([new ClipboardItem({
-        "text/html": new Blob([docForExport().innerHTML], { type: "text/html" }),
-        "text/plain": new Blob([docText(docEditor)], { type: "text/plain" }),
-      })]);
-    } else {
-      await writeClipboardText(docText(docEditor));
-    }
-    showToast(t("Copied"));
+    await writeClipboardText(text);
+    showToast(toast);
   } catch (err) {
     console.error(err);
     showToast(t("CopyFailed"));
@@ -1424,17 +1270,14 @@ function toMarkdown(node) {
   };
   const tag = node.tagName;
 
-  if (tag === "FIGURE") {
-    const img = node.querySelector("img");
-    const link = node.querySelector("figcaption a");
-    const caption = node.querySelector("figcaption");
-    const name = caption ? caption.textContent.split(" · ")[0] : "";
-    if (img) return "\n\n![" + (img.getAttribute("alt") || name) + "](" + img.getAttribute("src") + ")\n\n";
-    if (link) return "\n\n[" + name + "](" + link.getAttribute("href") + ")\n\n";
-    return "";
-  }
-
   switch (tag) {
+    case "FIGURE": {
+      const img = node.querySelector("img");
+      const link = node.querySelector("figcaption a");
+      const name = (node.querySelector("figcaption")?.textContent || "").split(" · ")[0];
+      const url = absoluteUrl(img ? img.getAttribute("src") : link.getAttribute("href"));
+      return "\n\n" + (img ? "!" : "") + "[" + name + "](" + url + ")\n\n";
+    }
     case "H1": case "H2": case "H3": case "H4": case "H5": case "H6":
       return "\n\n" + "#".repeat(Number(tag[1])) + " " + children().trim() + "\n\n";
     case "P":
@@ -1449,17 +1292,10 @@ function toMarkdown(node) {
       return inline("**");
     case "EM":
       return inline("*");
-    case "S":
-    case "DEL":
-      return inline("~~");
     case "CODE":
-      return node.parentElement && node.parentElement.tagName === "PRE"
-        ? node.textContent
-        : "`" + node.textContent + "`";
+      return node.parentElement.tagName === "PRE" ? node.textContent : "`" + node.textContent + "`";
     case "PRE":
       return "\n\n```\n" + node.textContent.replace(/\n$/, "") + "\n```\n\n";
-    case "BLOCKQUOTE":
-      return "\n\n" + children().trim().split("\n").map((line) => "> " + line).join("\n") + "\n\n";
     case "UL":
     case "OL": {
       const items = Array.from(node.children)
@@ -1467,49 +1303,27 @@ function toMarkdown(node) {
         .map((li, i) => (tag === "OL" ? i + 1 + ". " : "- ") + toMarkdown(li).trim());
       return "\n\n" + items.join("\n") + "\n\n";
     }
-    case "A":
-      return "[" + (children().trim() || node.getAttribute("href")) + "](" + node.getAttribute("href") + ")";
-    case "IMG":
-      return "![" + (node.getAttribute("alt") || "") + "](" + node.getAttribute("src") + ")";
-    case "TABLE": {
-      const rows = Array.from(node.querySelectorAll("tr")).map((tr) =>
-        Array.from(tr.children).map((cell) => toMarkdown(cell).replace(/\s*\n\s*/g, " ").trim()));
-      if (rows.length === 0) return "";
-      const width = Math.max(...rows.map((row) => row.length), 1);
-      const line = (row) => "| " + Array.from({ length: width }, (_, i) => row[i] || "").join(" | ") + " |";
-      const separator = "| " + Array(width).fill("---").join(" | ") + " |";
-      return "\n\n" + [line(rows[0]), separator, ...rows.slice(1).map(line)].join("\n") + "\n\n";
+    case "A": {
+      const href = absoluteUrl(node.getAttribute("href") || "");
+      return "[" + (children().trim() || href) + "](" + href + ")";
     }
     default:
       return children();
   }
 }
 
-async function copyMarkdown() {
-  let markdown;
-  if (state.mode === "doc") {
-    markdown = toMarkdown(docForExport()).replace(/\n{3,}/g, "\n\n").trim();
-  } else {
-    const lang = effectiveLang();
-    markdown = lang === "md" || lang === "txt"
-      ? textarea.value
-      : "```" + lang + "\n" + textarea.value.replace(/\n$/, "") + "\n```";
-  }
-  try {
-    await writeClipboardText(markdown);
-    showToast(t("CopiedMd"));
-  } catch (err) {
-    console.error(err);
-    showToast(t("CopyFailed"));
-  }
+function markdown() {
+  if (state.mode === "doc") return toMarkdown(docEditor).replace(/\n{3,}/g, "\n\n").trim();
+  const lang = effectiveLang();
+  if (lang === "md" || lang === "txt") return textarea.value;
+  return "```" + lang + "\n" + textarea.value.replace(/\n$/, "") + "\n```";
 }
 
-$("btn-copy").addEventListener("click", copyContent);
-$("btn-copy-md").addEventListener("click", copyMarkdown);
+$("btn-copy").addEventListener("click", () =>
+  copyText(state.mode === "doc" ? docText(docEditor) : textarea.value, t("Copied")));
+$("btn-copy-md").addEventListener("click", () => copyText(markdown(), t("CopiedMd")));
 
-// ---------------------------------------------------------------------------
-// Editing
-// ---------------------------------------------------------------------------
+// == Editing
 
 const INDENT = "    ";
 
@@ -1547,12 +1361,6 @@ textarea.addEventListener("input", () => {
 });
 
 textarea.addEventListener("keydown", (e) => {
-  if ((e.ctrlKey || e.metaKey) && e.key === "s") {
-    e.preventDefault();
-    saveNow();
-    return;
-  }
-
   if (e.key === "Tab" && !e.ctrlKey && !e.metaKey && !e.altKey) {
     e.preventDefault();
     if (e.shiftKey) {
@@ -1567,7 +1375,7 @@ textarea.addEventListener("keydown", (e) => {
 
 docEditor.addEventListener("input", () => onLocalEdit());
 
-docEditor.addEventListener("keydown", (e) => {
+document.addEventListener("keydown", (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === "s") {
     e.preventDefault();
     saveNow();
@@ -1581,21 +1389,18 @@ if (document.fonts && document.fonts.ready) {
   document.fonts.ready.then(updateLineNumbers);
 }
 
-// ---------------------------------------------------------------------------
-// Panel
-// ---------------------------------------------------------------------------
+// == Panel
 
 titleInput.addEventListener("input", () => {
-  if (state.padId) state.titleDirty = true;
+  // Sent with the next save, including one that creates the pad later.
+  state.titleDirty = true;
   scheduleSave();
 });
 
 function filterLangs() {
   const term = langFilter.value.toLowerCase();
   for (const option of langSelect.options) {
-    const name = option.text.toLowerCase();
-    const ext = option.value.toLowerCase();
-    option.hidden = !(name.includes(term) || ext.includes(term));
+    option.hidden = !(option.text.toLowerCase().includes(term) || option.value.includes(term));
   }
 }
 
@@ -1617,7 +1422,7 @@ langSelect.addEventListener("change", () => {
   onLocalEdit(true);
 });
 
-for (const radio of document.querySelectorAll('#expiry-list input[name="expires"]')) {
+for (const radio of expiryRadios) {
   radio.addEventListener("change", () => {
     // Without a pad this only picks the expiration of the next one.
     if (!state.padId) return;
@@ -1631,13 +1436,7 @@ padList.addEventListener("click", (e) => {
   if (item && item.dataset.id !== state.padId) openPad(item.dataset.id, true);
 });
 
-for (const link of [btnDownload, btnRaw]) {
-  link.addEventListener("click", (e) => {
-    if (!state.padId) e.preventDefault();
-  });
-}
-
-btnDelete.addEventListener("click", async () => {
+$("btn-delete").addEventListener("click", async () => {
   if (!state.padId || !window.confirm(t("ConfirmDelete"))) return;
   const id = state.padId;
   try {
@@ -1659,16 +1458,14 @@ $("btn-new").addEventListener("click", async () => {
 $("btn-home").addEventListener("click", (e) => {
   e.preventDefault();
   history.pushState(null, "", "/");
-  openLatest();
+  openPad(null, false);
 });
 
 btnPreview.addEventListener("click", togglePreview);
 
 window.addEventListener("popstate", route);
 
-// ---------------------------------------------------------------------------
-// Start
-// ---------------------------------------------------------------------------
+// == Start
 
 setMode("code");
 connectEvents();

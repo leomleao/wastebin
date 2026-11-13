@@ -138,11 +138,7 @@ pub async fn get<E>(
             Err(err) => return Err(err.into()),
         };
 
-        let Data {
-            text,
-            bytes,
-            metadata,
-        } = data;
+        let Data { text, metadata, .. } = data;
         let Metadata {
             uid: owner_uid,
             title,
@@ -157,13 +153,12 @@ pub async fn get<E>(
 
         let ext = key.ext.as_deref().or(metadata.extension.as_deref());
         let (is_image, is_pdf) = if metadata.is_asset {
-            let mime = crate::media::asset_mime(&bytes, ext);
+            let mime = crate::media::asset_mime(ext);
             (mime.starts_with("image/"), mime == "application/pdf")
         } else {
             (false, false)
         };
-        let is_document =
-            metadata.is_pad && key.ext.is_none() && crate::detect::is_document(ext, &text);
+        let is_document = metadata.is_pad && key.ext.is_none() && ext == Some("rich");
         // Pads change all the time, so their HTML is never cached.
         let cacheable = is_available && no_password && !metadata.is_pad;
 
@@ -299,7 +294,7 @@ mod tests {
         let client = Client::new(StoreCookies(false)).await;
 
         let url = client
-            .upload_asset("data:image/png;base64,iVBORw0KGgo=", "screenshot.png")
+            .upload_asset(b"\x89PNG\r\n\x1a\n", "image/png", "screenshot.png")
             .await?;
         let html = client
             .get(&url.replacen("/raw", "", 1))
@@ -314,7 +309,7 @@ mod tests {
         );
 
         let url = client
-            .upload_asset("data:application/pdf;base64,JVBERi0xLjQ=", "paper.pdf")
+            .upload_asset(b"%PDF-1.4", "application/pdf", "paper.pdf")
             .await?;
         let html = client
             .get(&url.replacen("/raw", "", 1))
