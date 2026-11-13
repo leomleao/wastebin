@@ -31,6 +31,9 @@ const UNOWNED_ASSET_EXPIRY: u32 = 86_400;
 /// How long the pad created for a `create_key` is remembered.
 const CREATE_KEY_TTL: Duration = Duration::from_secs(600);
 
+/// Longest accepted `create_key`.
+const MAX_CREATE_KEY_LEN: usize = 64;
+
 /// Pads created recently, by the `create_key` of the request that created them. An editor that
 /// lost the response to a create retries with the same key and gets the same pad back instead of
 /// a second one. Memory is enough: losing a response right when the server restarts is rare, and
@@ -227,7 +230,24 @@ pub async fn get_pad(
     Ok(Json(loaded(highlighter, id, data).await))
 }
 
-/// POST handler creating a new pad. Retries with the same `create_key` return the same pad.
+/// The changes a write request makes to an existing pad: the content, and the title,
+/// expiration and label when present.
+fn pad_update(req: PadWriteRequest, extension: &str) -> write::PadUpdate {
+    write::PadUpdate {
+        extension: Some(extension.to_string()),
+        preview: req
+            .preview
+            .as_deref()
+            .map(|p| trimmed(p, MAX_PREVIEW_CHARS)),
+        title: req.title.as_deref().map(|t| trimmed(t, usize::MAX)),
+        expires: req.expires.map(NonZeroU32::new),
+        base_revision: req.base_revision,
+        text: req.content,
+    }
+}
+
+/// POST handler creating a new pad. A retry with the same `create_key` updates the pad the key
+/// created instead of creating another one.
 pub async fn create_pad(
     State(db): State<Database>,
     State(page): State<Page>,
@@ -235,15 +255,50 @@ pub async fn create_pad(
     Json(req): Json<PadWriteRequest>,
 ) -> Result<Json<PadResponse>, JsonErrorResponse> {
     let extension = pad_extension(&req)?;
-
-    // Held until the pad is recorded, so that a retry racing the original waits for it.
-    let mut created = CREATED.lock().await;
-    created.retain(|_, (_, at)| at.elapsed() < CREATE_KEY_TTL);
-    if let Some((id, _)) = req.create_key.as_ref().and_then(|key| created.get(key))
-        && let Ok(metadata) = db.get_metadata(*id).await
+    if req
+        .create_key
+        .as_ref()
+        .is_some_and(|key| key.len() > MAX_CREATE_KEY_LEN)
     {
-        let extension = metadata.extension.clone().unwrap_or(extension);
-        return Ok(Json(saved(*id, extension, &metadata)));
+        return Err(bad_request(StatusCode::BAD_REQUEST, "create_key too long"));
+    }
+
+    // Finish even when the request is dropped (timeout, disconnect), so that a pad that was
+    // inserted always has its key recorded and a retry cannot duplicate it.
+    tokio::spawn(create(db, page, pad_tx, req, extension))
+        .await
+        .map_err(Error::Join)?
+}
+
+async fn create(
+    db: Database,
+    page: Page,
+    pad_tx: broadcast::Sender<String>,
+    mut req: PadWriteRequest,
+    extension: String,
+) -> Result<Json<PadResponse>, JsonErrorResponse> {
+    // Held until the pad is recorded, so that a retry racing the original waits for it.
+    let mut created = match &req.create_key {
+        Some(_) => Some(CREATED.lock().await),
+        None => None,
+    };
+
+    if let Some(created) = created.as_mut() {
+        created.retain(|_, (_, at)| at.elapsed() < CREATE_KEY_TTL);
+        let known = req.create_key.as_ref().and_then(|key| created.get(key));
+        if let Some(&(id, _)) = known {
+            // The client did not see the first response: apply what it sends now.
+            req.base_revision = None;
+            match db.update_pad(id, pad_update(req.clone(), &extension)).await {
+                Ok(metadata) => {
+                    broadcast(&pad_tx, "update", id, metadata.updated_at.as_deref());
+                    return Ok(Json(saved(id, extension, &metadata)));
+                }
+                // Deleted since: create it anew.
+                Err(db::Error::NotFound) => {}
+                Err(err) => return Err(Error::Database(err).into()),
+            }
+        }
     }
 
     let entry = write::Entry {
@@ -260,7 +315,7 @@ pub async fn create_pad(
     };
 
     let (id, _) = db.insert(entry).await.map_err(Error::Database)?;
-    if let Some(key) = req.create_key {
+    if let (Some(created), Some(key)) = (created.as_mut(), req.create_key) {
         created.insert(key, (id, Instant::now()));
     }
     drop(created);
@@ -285,17 +340,7 @@ pub async fn update_pad(
     let extension = pad_extension(&req)?;
     let has_base = req.base_revision.is_some();
 
-    let update = write::PadUpdate {
-        extension: Some(extension.clone()),
-        preview: req
-            .preview
-            .as_deref()
-            .map(|p| trimmed(p, MAX_PREVIEW_CHARS)),
-        title: req.title.as_deref().map(|t| trimmed(t, usize::MAX)),
-        expires: req.expires.map(NonZeroU32::new),
-        base_revision: req.base_revision,
-        text: req.content,
-    };
+    let update = pad_update(req, &extension);
 
     let metadata = match db.update_pad(id, update).await {
         Ok(metadata) => metadata,
@@ -698,17 +743,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_is_idempotent_per_key() -> Result<(), Box<dyn std::error::Error>> {
+    async fn create_retry_applies_to_the_same_pad() -> Result<(), Box<dyn std::error::Error>> {
         let client = Client::new(StoreCookies(false)).await;
 
-        let req = PadWriteRequest {
-            create_key: Some("retry-me".to_string()),
-            ..write("first attempt")
-        };
-        let first = create(&client, &req).await?;
-        let again = create(&client, &req).await?;
-        assert_eq!(first.id, again.id);
-        assert_eq!(first.revision, again.revision);
+        let key = Some("retry-me".to_string());
+        let first = create(
+            &client,
+            &PadWriteRequest {
+                create_key: key.clone(),
+                ..write("abc")
+            },
+        )
+        .await?;
+
+        // The retry carries what was typed since, and a title and expiration.
+        let again = create(
+            &client,
+            &PadWriteRequest {
+                create_key: key.clone(),
+                title: Some("typed meanwhile".to_string()),
+                expires: Some(3600),
+                ..write("abcdef")
+            },
+        )
+        .await?;
+        assert_eq!(again.id, first.id);
+        assert!(again.revision > first.revision);
+        assert_eq!(again.title.as_deref(), Some("typed meanwhile"));
+        assert!(again.expires_in.is_some());
+
+        let pad = client
+            .get(&format!("/api/pad/{}", first.id))
+            .send()
+            .await?
+            .json::<PadResponse>()
+            .await?;
+        assert_eq!(pad.content.as_deref(), Some("abcdef"));
 
         let other = create(
             &client,
@@ -720,6 +790,13 @@ mod tests {
         .await?;
         assert_ne!(other.id, first.id);
 
+        let too_long = PadWriteRequest {
+            create_key: Some("k".repeat(65)),
+            ..write("x")
+        };
+        let res = client.post("/api/pad").json(&too_long).send().await?;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
         let pads = client
             .get("/api/pads")
             .send()
@@ -727,6 +804,36 @@ mod tests {
             .json::<Vec<PadSummary>>()
             .await?;
         assert_eq!(pads.len(), 2);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn create_cut_off_by_the_timeout_still_records_its_key()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let client = Client::with_timeout(StoreCookies(false), Duration::from_millis(200)).await;
+        let req = PadWriteRequest {
+            create_key: Some("slow-create".to_string()),
+            ..write("text")
+        };
+
+        // Stall creates until the server has answered 408 and dropped the request.
+        let lock = CREATED.lock().await;
+        let res = client.post("/api/pad").json(&req).send().await?;
+        assert_eq!(res.status(), StatusCode::REQUEST_TIMEOUT);
+        drop(lock);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The create completed anyway, and the retry finds it instead of duplicating it.
+        let pads = client
+            .get("/api/pads")
+            .send()
+            .await?
+            .json::<Vec<PadSummary>>()
+            .await?;
+        assert_eq!(pads.len(), 1);
+        let retried = create(&client, &req).await?;
+        assert_eq!(retried.id, pads[0].id);
 
         Ok(())
     }

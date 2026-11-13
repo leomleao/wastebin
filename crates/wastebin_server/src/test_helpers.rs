@@ -24,6 +24,11 @@ pub(crate) struct StoreCookies(pub bool);
 
 impl Client {
     pub(crate) async fn new(store_cookies: StoreCookies) -> Self {
+        Self::with_timeout(store_cookies, Duration::from_secs(30)).await
+    }
+
+    /// Server whose requests time out after `timeout`.
+    pub(crate) async fn with_timeout(store_cookies: StoreCookies, timeout: Duration) -> Self {
         let (db, handler) = Database::new(db::Open::Memory).expect("open memory database");
         let cache = Cache::new(NonZeroUsize::new(128).unwrap()).unwrap();
         let key = Key::generate();
@@ -53,7 +58,7 @@ impl Client {
         tokio::spawn(handler);
 
         tokio::spawn(async move {
-            let app = crate::make_app(state, Duration::from_secs(30), 1024 * 1024);
+            let app = crate::make_app(state, timeout, 1024 * 1024);
 
             axum::serve(listener, app)
                 .with_graceful_shutdown(crate::shutdown_signal())
