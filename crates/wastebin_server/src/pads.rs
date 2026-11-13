@@ -20,6 +20,7 @@ use crate::{AppState, Highlighter, Page};
 use wastebin_core::db::read::{Data, Metadata, PadSummary};
 use wastebin_core::db::{self, Database, write};
 use wastebin_core::id::Id;
+use wastebin_highlight::markdown::markdown_to_editor_html;
 
 /// Number of pads listed by [`Pads::list`].
 const RECENT_PADS: usize = 20;
@@ -36,7 +37,7 @@ const MAX_CREATE_KEY_LEN: usize = 64;
 /// Longest pad label kept for the pad list.
 const MAX_PREVIEW_CHARS: usize = 80;
 
-/// Attempts [`Pads::append`] makes before giving up on a pad that keeps changing under it.
+/// Attempts [`Pads::rewrite`] makes before giving up on a pad that keeps changing under it.
 const APPEND_TRIES: usize = 5;
 
 /// Pads created recently, by the `create_key` of the request that created them. An editor that
@@ -112,7 +113,6 @@ impl PadFile {
     }
 
     /// MIME type the file is served with.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by the MCP server"))]
     pub fn mime(&self) -> &'static str {
         crate::media::asset_mime(Some(&self.extension))
     }
@@ -182,7 +182,6 @@ impl Pads {
 
     /// Pad `id` with its content but without highlighting. `id` may carry an extension
     /// (`abc.rs`). Entries that are not pads are reported as not found and left untouched.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by the MCP server"))]
     pub async fn get(&self, id: &str) -> Result<PadResponse, PadError> {
         let id = parse_pad_id(id)?;
         let data = self.db.get_pad(id).await?;
@@ -282,26 +281,59 @@ impl Pads {
     }
 
     /// Append `text` to pad `id` on a new line, keeping its language, title, expiration and
-    /// label. A concurrent write is never lost: the append is retried on the newer content, up
-    /// to a few times before failing with [`PadError::Conflict`]. Returns the pad without its
-    /// content.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by the MCP server"))]
+    /// label. To a document pad, `text` is Markdown and is appended as HTML. A concurrent write
+    /// is never lost: see [`Pads::rewrite`]. Returns the pad without its content.
     pub async fn append(&self, id: &str, text: &str) -> Result<PadResponse, PadError> {
+        self.rewrite(id, |current, extension| {
+            let text = if extension == "rich" {
+                markdown_to_editor_html(text)
+            } else {
+                text.to_string()
+            };
+            (appended(current, &text), extension.to_string())
+        })
+        .await
+    }
+
+    /// Add `file`, uploaded into pad `id`, at the end of the pad with the markup the editor
+    /// gives a pasted file. Like the editor, this turns a code pad into a document pad. Returns
+    /// the pad without its content.
+    pub async fn attach(&self, id: &str, file: &PadFile) -> Result<PadResponse, PadError> {
+        self.rewrite(id, |current, extension| {
+            let mut html = if extension == "rich" {
+                current.to_string()
+            } else {
+                text_to_doc_html(current)
+            };
+            html.push_str(&figure_html(file));
+            html.push_str("<div><br></div>");
+            (html, "rich".to_string())
+        })
+        .await
+    }
+
+    /// Replace the content and extension of pad `id` with `change(content, extension)`, keeping
+    /// its title, expiration and label. The write is conditional on the content `change` saw, and
+    /// retried on newer content up to a few times before failing with [`PadError::Conflict`], so
+    /// that a concurrent write is never lost.
+    async fn rewrite(
+        &self,
+        id: &str,
+        change: impl Fn(&str, &str) -> (String, String),
+    ) -> Result<PadResponse, PadError> {
         let id = parse_pad_id(id)?;
 
         for _ in 0..APPEND_TRIES {
             let current = self.db.get_pad(id).await?;
-            let extension = current
-                .metadata
-                .extension
-                .unwrap_or_else(|| "txt".to_string());
+            let extension = current.metadata.extension.as_deref().unwrap_or("txt");
+            let (text, extension) = change(&current.text, extension);
             let update = write::PadUpdate {
                 extension: Some(extension.clone()),
                 preview: None,
                 title: None,
                 expires: None,
                 base_revision: current.metadata.updated_at,
-                text: appended(&current.text, text),
+                text,
             };
 
             match self.write(id, update).await {
@@ -370,7 +402,6 @@ impl Pads {
     }
 
     /// The images and PDFs uploaded into pad `id`, oldest first. Empty for an unknown pad.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by the MCP server"))]
     pub async fn files(&self, id: &str) -> Result<Vec<PadFile>, PadError> {
         let id = parse_pad_id(id)?;
         let mut files = Vec::new();
@@ -468,8 +499,53 @@ fn appended(current: &str, text: &str) -> String {
     }
 }
 
+/// `text` of a code pad as the lines of a document pad, as the editor converts it.
+fn text_to_doc_html(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    text.split('\n')
+        .map(|line| match line {
+            "" => "<div><br></div>".to_string(),
+            line => format!("<div>{}</div>", escape_html(line)),
+        })
+        .collect()
+}
+
+/// The editor's markup for `file`: an image, or a PDF the editor embeds, with a caption.
+fn figure_html(file: &PadFile) -> String {
+    let name = escape_html(&file.name);
+    let path = file.path();
+    let size = crate::media::format_size(file.size);
+    let (head, open) = if file.extension == "pdf" {
+        (
+            format!(r#"<figure class="inline-asset" data-kind="pdf" data-src="/raw/{path}">"#),
+            format!(r#"<a href="/raw/{path}">open</a> · "#),
+        )
+    } else {
+        (
+            format!(
+                r#"<figure class="inline-asset" data-kind="image"><img src="/raw/{path}" alt="{name}">"#
+            ),
+            String::new(),
+        )
+    };
+
+    format!(
+        r#"{head}<figcaption>{name} · {size} · {open}<a href="/dl/{path}">download</a></figcaption></figure>"#
+    )
+}
+
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 /// Expiration for a new pad: `0` never expires, `None` uses the configured default.
-fn new_expiration(page: &Page, expires: Option<u32>) -> Option<NonZeroU32> {
+pub(crate) fn new_expiration(page: &Page, expires: Option<u32>) -> Option<NonZeroU32> {
     match expires {
         Some(secs) => NonZeroU32::new(secs),
         None => page
@@ -486,7 +562,8 @@ fn trimmed(text: &str, max_chars: usize) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn parse_pad_id(raw: &str) -> Result<Id, Error> {
+/// Id of an entry from `raw`, which may carry an extension (`abc.rs`).
+pub(crate) fn parse_pad_id(raw: &str) -> Result<Id, Error> {
     let base = raw.split_once('.').map_or(raw, |(id, _)| id);
     base.parse::<Id>().map_err(Error::Id)
 }
@@ -725,6 +802,46 @@ mod tests {
                 .await,
             Err(PadError::UnsupportedMedia)
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attach_adds_the_file_like_the_editor() -> Result<(), Box<dyn std::error::Error>> {
+        let pads = Pads::from_ref(&crate::test_helpers::state());
+        let created = pads
+            .create(write("a\n\nb<"))
+            .await
+            .map_err(|err| format!("{err:?}"))?;
+        let file = pads
+            .upload(Some(&created.id), "image/png", Some("a\"b.png"), b"\x89PNG")
+            .await
+            .map_err(|err| format!("{err:?}"))?;
+
+        let attached = pads
+            .attach(&created.id, &file)
+            .await
+            .map_err(|err| format!("{err:?}"))?;
+        assert_eq!(attached.extension, "rich");
+
+        let pad = pads
+            .get(&created.id)
+            .await
+            .map_err(|err| format!("{err:?}"))?;
+        let path = file.path();
+        assert_eq!(
+            pad.content.as_deref(),
+            Some(
+                format!(
+                    "<div>a</div><div><br></div><div>b&lt;</div>\
+                     <figure class=\"inline-asset\" data-kind=\"image\">\
+                     <img src=\"/raw/{path}\" alt=\"a&quot;b.png\">\
+                     <figcaption>a&quot;b.png · 4 B · <a href=\"/dl/{path}\">download</a>\
+                     </figcaption></figure><div><br></div>"
+                )
+                .as_str()
+            )
+        );
 
         Ok(())
     }
