@@ -55,6 +55,12 @@ const state = {
   pending: false,
   saveTimer: null,
   retryDelay: 0,
+  // Key that makes retries of a lost create return the same pad.
+  createKey: null,
+  // An update was announced while local edits were pending: check again once they are saved.
+  remoteSkipped: false,
+  // The open pad was deleted elsewhere; the editor is read-only until New.
+  deleted: false,
   // Bumped whenever another pad is shown, so that late responses for the old one are dropped.
   generation: 0,
   // Highlighted HTML of each line the server highlighted last, keyed by the line's text.
@@ -86,7 +92,7 @@ function setStatus(text) {
 }
 
 function padUrl(id) {
-  return "/?pad=" + encodeURIComponent(id);
+  return "/pad/" + id;
 }
 
 function absoluteUrl(url) {
@@ -694,6 +700,7 @@ function hasUnsavedChanges() {
 }
 
 function scheduleSave(immediate) {
+  if (state.deleted) return;
   clearTimeout(state.saveTimer);
   state.saveTimer = null;
   if (immediate) {
@@ -719,9 +726,10 @@ function onLocalEdit(immediate) {
   scheduleSave(immediate);
 }
 
-async function saveNow() {
+async function saveNow(force) {
   clearTimeout(state.saveTimer);
   state.saveTimer = null;
+  if (state.deleted) return;
 
   if (state.saving) {
     state.pending = true;
@@ -732,7 +740,7 @@ async function saveNow() {
   const extension = currentExtension();
   const isCreate = state.padId === null;
 
-  if (isCreate && content.trim() === "") return;
+  if (isCreate && content.trim() === "" && !force) return;
   if (!isCreate && content === state.lastSaved && extension === state.lastSavedExt &&
       !state.titleDirty && !state.expiryDirty) {
     return;
@@ -743,7 +751,12 @@ async function saveNow() {
   const sentExpiry = isCreate || state.expiryDirty;
   if (sentTitle) body.title = titleInput.value;
   if (sentExpiry) body.expires = selectedExpiry();
-  if (!isCreate) body.base_revision = state.revision;
+  if (isCreate) {
+    state.createKey = state.createKey || Math.random().toString(36).slice(2) + Date.now().toString(36);
+    body.create_key = state.createKey;
+  } else {
+    body.base_revision = state.revision;
+  }
   state.titleDirty = false;
   state.expiryDirty = false;
   const keepDirty = () => {
@@ -771,13 +784,13 @@ async function saveNow() {
       return;
     }
     if (resp.status === 404 && !isCreate) {
-      detachPad();
-      state.pending = true;
+      markDeleted();
       return;
     }
-    if (resp.status === 413) {
+    if (resp.status >= 400 && resp.status < 500) {
+      // Retrying would not help: keep the edits and say why they are not saved.
       keepDirty();
-      setStatus(t("TooLarge"));
+      setStatus(resp.status === 413 ? t("TooLarge") : t("Error"));
       return;
     }
     if (!resp.ok) throw new Error("save failed: " + resp.status);
@@ -787,6 +800,7 @@ async function saveNow() {
 
     if (isCreate) {
       state.padId = pad.id;
+      state.createKey = null;
       history.replaceState(null, "", padUrl(pad.id));
     }
     state.lastSaved = content;
@@ -825,19 +839,34 @@ async function saveNow() {
     } else if (state.pending) {
       state.pending = false;
       saveNow();
+    } else if (state.remoteSkipped) {
+      state.remoteSkipped = false;
+      syncRemote();
     }
   }
 }
 
-// Wait until everything typed so far reached the server, or gave up trying.
+// Save what is pending, once, and wait for it. Returns whether everything reached the server.
 async function flushSave() {
-  for (let i = 0; i < 100 && (state.saveTimer !== null || state.saving || state.pending); i++) {
-    if (state.saving) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    } else {
-      await saveNow();
-    }
+  if (state.saveTimer !== null || state.pending || (!state.saving && hasUnsavedChanges())) {
+    await saveNow();
   }
+  while (state.saving || state.pending) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return !hasUnsavedChanges();
+}
+
+// Whether the editor may show something else: never drop unsaved edits without asking.
+async function canLeave() {
+  return (await flushSave()) || window.confirm(t("ConfirmDiscard"));
+}
+
+// The pad must exist before images can be uploaded into it.
+async function ensurePad() {
+  await flushSave();
+  if (!state.padId) await saveNow(true);
+  return state.padId;
 }
 
 // The single region in which `before` and `after` differ: [start, end in before, end in after).
@@ -897,12 +926,21 @@ function rebase(mine, pad) {
   state.pending = true;
 }
 
-// The open pad was deleted or expired elsewhere: keep the text, which saves as a new pad.
-function detachPad() {
-  Object.assign(state, { padId: null, lastSaved: null, revision: null });
-  state.titleDirty = titleInput.value.trim() !== "";
+// The open pad was deleted or expired elsewhere: keep showing its text, read-only, until New.
+function markDeleted() {
+  clearTimeout(state.saveTimer);
+  Object.assign(state, { saveTimer: null, pending: false, padId: null, revision: null, deleted: true });
+  state.lastSaved = currentContent();
+  setReadOnly(true);
+  setStatus(t("Deleted"));
   updatePadActions();
   updateView();
+}
+
+function setReadOnly(readOnly) {
+  textarea.readOnly = readOnly;
+  titleInput.readOnly = readOnly;
+  docEditor.contentEditable = String(!readOnly);
 }
 
 // Replace the text of the current editor, keeping the caret where it was relative to the text.
@@ -911,6 +949,7 @@ function setContent(text) {
     const caret = docCaretOffset();
     setDocHtml(text);
     restoreDocCaret(caret);
+    updateStats();
     return;
   }
   const [before, start, end] = [textarea.value, textarea.selectionStart, textarea.selectionEnd];
@@ -939,8 +978,12 @@ function resetEditor() {
     expiryDirty: false,
     expiresIn: null,
     retryDelay: 0,
+    createKey: null,
+    remoteSkipped: false,
+    deleted: false,
     rows: new Map(),
   });
+  setReadOnly(false);
 
   textarea.value = "";
   codeHighlight.replaceChildren();
@@ -1008,7 +1051,10 @@ function applyPad(pad, live) {
 
 // Open pad `id`, or the most recently changed one.
 async function openPad(id, push) {
-  await flushSave();
+  if (!(await canLeave())) {
+    if (state.padId) history.replaceState(null, "", padUrl(state.padId));
+    return;
+  }
   resetEditor();
   const generation = state.generation;
   const pad = id ? await fetchPad(id) : await fetch("/api/pad/latest").then((r) => r.json(), () => null);
@@ -1022,7 +1068,9 @@ async function openPad(id, push) {
 }
 
 function route() {
-  const id = new URLSearchParams(window.location.search).get("pad");
+  // `/?pad=` links of earlier builds open, and are rewritten to, `/pad/{id}`.
+  const path = window.location.pathname.match(/^\/pad\/(.+)$/);
+  const id = path ? decodeURIComponent(path[1]) : new URLSearchParams(window.location.search).get("pad");
   if (id) return openPad(id, false);
   if (window.location.pathname === "/new") {
     resetEditor();
@@ -1059,8 +1107,12 @@ async function togglePreview() {
 // == Live updates: events only say which pad changed to which revision.
 
 async function syncRemote() {
-  // With local edits pending, the next save is refused and rebased instead.
-  if (!state.padId || hasUnsavedChanges()) return;
+  if (!state.padId) return;
+  if (hasUnsavedChanges()) {
+    // The next save is refused and rebased; or, if it gets through first, check again after it.
+    state.remoteSkipped = true;
+    return;
+  }
   const generation = state.generation;
   const pad = await fetchPad(state.padId);
   if (!pad || generation !== state.generation || hasUnsavedChanges() ||
@@ -1088,8 +1140,7 @@ function onPadEvent(event) {
   if (!msg.id || msg.id !== state.padId) return;
 
   if (msg.type === "deleted") {
-    detachPad();
-    setStatus(t("Deleted"));
+    markDeleted();
     return;
   }
 
@@ -1128,9 +1179,10 @@ function isMediaFile(file) {
   return file.type.startsWith("image/") || file.type === "application/pdf";
 }
 
-// Upload an image or PDF as is; it expires with the pad that shows it.
+// Upload an image or PDF as is, into the open pad, which deletes it along with itself.
 async function upload(blob, filename) {
-  const resp = await fetch("/api/asset?filename=" + encodeURIComponent(filename), {
+  const query = "?pad=" + encodeURIComponent(state.padId) + "&filename=" + encodeURIComponent(filename);
+  const resp = await fetch("/api/asset" + query, {
     method: "POST",
     headers: { "Content-Type": blob.type },
     body: blob,
@@ -1140,7 +1192,12 @@ async function upload(blob, filename) {
 }
 
 async function insertAssets(files) {
+  if (state.deleted) return;
   switchToDoc();
+  if (!(await ensurePad())) {
+    showToast(t("UploadFailed"));
+    return;
+  }
   for (const file of files) {
     setStatus(t("Uploading"));
     try {
@@ -1156,7 +1213,7 @@ async function insertAssets(files) {
 // A text file opens as a new pad, in the language its extension names.
 async function loadTextFile(file) {
   const text = await file.text();
-  await flushSave();
+  if (!(await canLeave())) return;
   newPad();
   textarea.value = text.replace(/\n$/, "");
   const ext = (file.name.match(/\.([^.]+)$/) || [])[1] || "auto";
@@ -1408,6 +1465,10 @@ langFilter.addEventListener("input", filterLangs);
 
 langSelect.addEventListener("change", () => {
   const value = langSelect.value;
+  if (state.deleted) {
+    selectLang(state.lang);
+    return;
+  }
   if (value === "rich") {
     switchToDoc();
   } else if (state.mode === "doc" && !switchToCode()) {
@@ -1425,7 +1486,7 @@ langSelect.addEventListener("change", () => {
 for (const radio of expiryRadios) {
   radio.addEventListener("change", () => {
     // Without a pad this only picks the expiration of the next one.
-    if (!state.padId) return;
+    if (!state.padId || state.deleted) return;
     state.expiryDirty = true;
     scheduleSave(true);
   });
@@ -1451,8 +1512,7 @@ $("btn-delete").addEventListener("click", async () => {
 });
 
 $("btn-new").addEventListener("click", async () => {
-  await flushSave();
-  newPad();
+  if (await canLeave()) newPad();
 });
 
 $("btn-home").addEventListener("click", (e) => {
@@ -1462,6 +1522,44 @@ $("btn-home").addEventListener("click", (e) => {
 });
 
 btnPreview.addEventListener("click", togglePreview);
+
+// Language and expiration live in a popover behind the cog.
+const btnSettings = $("btn-settings");
+const settings = $("settings");
+
+function showSettings(open) {
+  settings.classList.toggle("hidden", !open);
+  btnSettings.setAttribute("aria-expanded", String(open));
+}
+
+btnSettings.addEventListener("click", () => showSettings(settings.classList.contains("hidden")));
+document.addEventListener("click", (e) => {
+  if (!settings.contains(e.target) && !btnSettings.contains(e.target)) showSettings(false);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") showSettings(false);
+});
+
+// The sidebar collapses; the choice is remembered per browser.
+const contentArea = $("content-area");
+const btnSidebar = $("btn-sidebar");
+
+function showSidebar(open) {
+  contentArea.classList.toggle("sidebar-collapsed", !open);
+  btnSidebar.setAttribute("aria-expanded", String(open));
+  try {
+    localStorage.setItem("wastebin-sidebar", open ? "open" : "closed");
+  } catch (_) {
+    // Storage may be unavailable; the sidebar then starts open.
+  }
+}
+
+btnSidebar.addEventListener("click", () => showSidebar(contentArea.classList.contains("sidebar-collapsed")));
+try {
+  if (localStorage.getItem("wastebin-sidebar") === "closed") showSidebar(false);
+} catch (_) {
+  // See above.
+}
 
 window.addEventListener("popstate", route);
 

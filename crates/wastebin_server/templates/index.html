@@ -14,6 +14,8 @@
   data-i18n-deleted="{{ lang.t("index.status.deleted") }}"
   data-i18n-too-large="{{ lang.t("index.status.too_large") }}"
   data-i18n-conflict="{{ lang.t("index.status.conflict") }}"
+  data-i18n-error="{{ lang.t("index.status.error") }}"
+  data-i18n-confirm-discard="{{ lang.t("index.confirm.discard") }}"
   data-i18n-copied="{{ lang.t("paste.toast.copied_content") }}"
   data-i18n-copied-md="{{ lang.t("index.toast.copied_markdown") }}"
   data-i18n-copy-failed="{{ lang.t("index.toast.copy_failed") }}"
@@ -49,6 +51,40 @@
       </button>
       <button type="button" id="open" class="nav-button" title="{{ lang.t("nav.upload") }}" aria-label="{{ lang.t("nav.upload") }}">
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg>
+      </button>
+      <div class="settings">
+        <button type="button" id="btn-settings" class="nav-button" title="{{ lang.t("nav.settings") }}" aria-label="{{ lang.t("nav.settings") }}" aria-expanded="false" aria-controls="settings">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+        </button>
+        <div id="settings" class="settings-popover hidden" role="dialog" aria-label="{{ lang.t("nav.settings") }}">
+          <section class="panel-section">
+            <input type="search" id="filter" class="input-base lang-filter" placeholder="{{ lang.t("index.placeholder.filter") }}" autocomplete="off">
+            <select id="langs" class="lang-select" size="12" aria-label="{{ lang.t("index.aria.language") }}">
+              <option value="auto" selected>{{ lang.t("index.lang.auto") }}</option>
+              <option value="rich">{{ lang.t("index.lang.document") }}</option>
+            {%- for syntax in highlighter.syntaxes() -%}
+              {%- if let Some(extension) = syntax.extensions.first() %}
+              <option value="{{ extension }}">{{ syntax.name }}</option>
+              {%- endif -%}
+            {%- endfor %}
+            </select>
+          </section>
+
+          <section class="panel-section">
+            <div class="panel-label">{{ lang.t("index.label.expires") }}</div>
+            <div class="expiry-list" id="expiry-list">
+              {% for expiration in page.expirations %}
+              <label class="expiry-btn">
+                <input type="radio" name="expires" value="{{ expiration.duration.as_secs() }}" {% if expiration.default %}checked{% endif %}>
+                <span>{{ lang.duration(expiration) }}</span>
+              </label>
+              {% endfor %}
+            </div>
+          </section>
+        </div>
+      </div>
+      <button type="button" id="btn-sidebar" class="nav-button" title="{{ lang.t("nav.sidebar") }}" aria-label="{{ lang.t("nav.sidebar") }}" aria-expanded="true" aria-controls="sidebar">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/></svg>
       </button>
         <div class="theme-switcher">
           {% match theme %}
@@ -117,34 +153,9 @@
       </div>
     </main>
 
-    <aside class="panel">
+    <aside class="panel" id="sidebar">
       <section class="panel-section">
         <input type="text" id="title" class="input-base" aria-label="{{ lang.t("index.label.title") }}" placeholder="{{ lang.t("index.placeholder.title") }}" autocomplete="off">
-      </section>
-
-      <section class="panel-section">
-        <input type="search" id="filter" class="input-base lang-filter" placeholder="{{ lang.t("index.placeholder.filter") }}" autocomplete="off">
-        <select id="langs" class="lang-select" size="12" aria-label="{{ lang.t("index.aria.language") }}">
-          <option value="auto" selected>{{ lang.t("index.lang.auto") }}</option>
-          <option value="rich">{{ lang.t("index.lang.document") }}</option>
-        {%- for syntax in highlighter.syntaxes() -%}
-          {%- if let Some(extension) = syntax.extensions.first() %}
-          <option value="{{ extension }}">{{ syntax.name }}</option>
-          {%- endif -%}
-        {%- endfor %}
-        </select>
-      </section>
-
-      <section class="panel-section">
-        <div class="panel-label">{{ lang.t("index.label.expires") }}</div>
-        <div class="expiry-list" id="expiry-list">
-          {% for expiration in page.expirations %}
-          <label class="expiry-btn">
-            <input type="radio" name="expires" value="{{ expiration.duration.as_secs() }}" {% if expiration.default %}checked{% endif %}>
-            <span>{{ lang.duration(expiration) }}</span>
-          </label>
-          {% endfor %}
-        </div>
       </section>
 
       <section class="panel-section">
