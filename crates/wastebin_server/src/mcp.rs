@@ -26,6 +26,7 @@ use url::Url;
 
 use crate::cache::valid_extension;
 use crate::errors::Error;
+use crate::handlers::insert;
 use crate::pads::{PadError, PadResponse, PadWriteRequest, Pads, new_expiration, parse_pad_id};
 use crate::{AppState, Page};
 use wastebin_core::db::{self, Database, read::Entry, write};
@@ -367,25 +368,22 @@ impl Mcp {
         Extension(parts): Extension<Parts>,
         Parameters(args): Parameters<CreatePasteArgs>,
     ) -> ToolResult {
-        let expires = new_expiration(&self.page, self.expiration(args.expires)?);
-        let extension = args.language.filter(|ext| !ext.is_empty());
-        if extension
+        // As `POST /`, but without an owner: no client could ever claim it.
+        let entry = write::Entry::from(insert::api::Entry {
+            text: args.text,
+            extension: args.language,
+            expires: new_expiration(&self.page, self.expiration(args.expires)?),
+            burn_after_reading: args.burn,
+            password: args.password,
+            ..Default::default()
+        });
+        if entry
+            .extension
             .as_deref()
             .is_some_and(|ext| !valid_extension(ext))
         {
             return Err(message("invalid language"));
         }
-
-        let uid = self.db.next_uid().await.map_err(db_failure)?;
-        let entry = write::Entry {
-            text: args.text,
-            extension,
-            expires,
-            burn_after_reading: args.burn,
-            uid: Some(uid),
-            password: args.password.filter(|password| !password.is_empty()),
-            ..Default::default()
-        };
         let (id, entry) = self.db.insert(entry).await.map_err(db_failure)?;
         let path = id.to_url_path(&entry);
         let base = self.base(&parts);

@@ -7,6 +7,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
+use crate::handlers::extract::verify_owner_token;
 use crate::test_helpers::{Client, StoreCookies, state_with};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -591,6 +592,36 @@ async fn paste_tools_round_trip() -> TestResult {
         json!({ "text": "x", "language": "../x" }),
     )
     .await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_paste_mints_no_owner() -> TestResult {
+    let state = state_with("0", true);
+    let key = state.key.clone();
+    let client = Client::with_state(state, StoreCookies(false), Duration::from_secs(30)).await;
+
+    // The uid of a paste created through `POST /`, read from its owner token.
+    let uid = async || -> Result<i64, Box<dyn std::error::Error>> {
+        let res: Value = client
+            .post_json()
+            .json(&json!({ "text": "x" }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(verify_owner_token(&key, str_of(&res, "owner")).ok_or("bad owner token")?)
+    };
+
+    let before = uid().await?;
+    call(
+        &client,
+        "create_paste",
+        json!({ "text": "x", "password": "" }),
+    )
+    .await?;
+    assert_eq!(uid().await?, before + 1);
 
     Ok(())
 }
