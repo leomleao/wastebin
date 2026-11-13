@@ -20,7 +20,9 @@ use crate::{AppState, Highlighter, Page};
 use wastebin_core::db::read::{Data, Metadata, PadSummary};
 use wastebin_core::db::{self, Database, write};
 use wastebin_core::id::Id;
-use wastebin_highlight::markdown::{figure_html, markdown_to_editor_html, text_to_editor_html};
+use wastebin_highlight::markdown::{
+    Uploads, figure_html, markdown_to_editor_html, text_to_editor_html,
+};
 
 /// Number of pads listed by [`Pads::list`].
 const RECENT_PADS: usize = 20;
@@ -281,19 +283,19 @@ impl Pads {
     }
 
     /// Append `text` to pad `id` on a new line, keeping its language, title, expiration and
-    /// label. To a document pad, `text` is Markdown and is appended as HTML blocks, its figures
-    /// showing the `sizes` of [`Pads::sizes`]. A concurrent write is never lost: see
-    /// [`Pads::rewrite`]. Returns the pad without its content.
+    /// label. To a document pad, `text` is Markdown and is appended as HTML blocks, converted
+    /// with `uploads`. A concurrent write is never lost: see [`Pads::rewrite`]. Returns the pad
+    /// without its content.
     pub async fn append(
         &self,
         id: &str,
         text: &str,
-        sizes: &HashMap<String, String>,
+        uploads: &Uploads,
     ) -> Result<PadResponse, PadError> {
         self.rewrite(id, |current, extension| {
             let text = if extension == "rich" {
                 // The editor shows every newline: blocks need none between them.
-                format!("{current}{}", markdown_to_editor_html(text, sizes))
+                format!("{current}{}", markdown_to_editor_html(text, uploads))
             } else {
                 appended(current, text)
             };
@@ -622,7 +624,7 @@ mod tests {
         assert!(events.recv().await?.contains("\"created\""));
 
         let appended = pads
-            .append(&created.id, "second", &HashMap::new())
+            .append(&created.id, "second", &Uploads::default())
             .await
             .map_err(|err| format!("{err:?}"))?;
         assert!(appended.revision > created.revision);
@@ -645,7 +647,7 @@ mod tests {
         );
 
         let missing = pads
-            .append(&Id::from(12345u32).to_string(), "x", &HashMap::new())
+            .append(&Id::from(12345u32).to_string(), "x", &Uploads::default())
             .await;
         assert!(matches!(
             missing,
@@ -667,7 +669,7 @@ mod tests {
             .map_err(|err| format!("{err:?}"))?;
 
         for text in ["second", "**third**"] {
-            pads.append(&created.id, text, &HashMap::new())
+            pads.append(&created.id, text, &Uploads::default())
                 .await
                 .map_err(|err| format!("{err:?}"))?;
         }
@@ -716,7 +718,7 @@ mod tests {
             let pads = pads.clone();
             let id = id.clone();
             tokio::spawn(async move {
-                pads.append(&id, &format!("line {n}"), &HashMap::new())
+                pads.append(&id, &format!("line {n}"), &Uploads::default())
                     .await
                     .is_ok()
             })
@@ -757,7 +759,7 @@ mod tests {
             .create(write("base"))
             .await
             .map_err(|err| format!("{err:?}"))?;
-        pads.append(&created.id, "more", &HashMap::new())
+        pads.append(&created.id, "more", &Uploads::default())
             .await
             .map_err(|err| format!("{err:?}"))?;
 

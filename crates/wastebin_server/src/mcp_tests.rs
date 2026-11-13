@@ -979,6 +979,46 @@ async fn noop_edit_leaves_an_uploaded_into_code_pad_unchanged() -> TestResult {
 }
 
 #[tokio::test]
+async fn documents_take_the_absolute_urls_of_uploads() -> TestResult {
+    let client = client().await;
+
+    let notes = create_pad(&client, json!({ "text": "notes" })).await?;
+    let png = structured(
+        &call(
+            &client,
+            "upload_file",
+            json!({ "pad": str_of(&notes, "id"), "filename": "fig.png", "data_base64": BASE64.encode(PNG) }),
+        )
+        .await?,
+    );
+    let url = str_of(&png, "url");
+    let path = path_of(url);
+
+    let doc = create_pad(
+        &client,
+        json!({ "text": format!("![x]({url})"), "language": "document" }),
+    )
+    .await?;
+    let id = str_of(&doc, "id");
+
+    let api: Value = client
+        .get(&format!("/api/pad/{id}"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let html = str_of(&api, "content");
+    assert!(html.starts_with("<figure class=\"inline-asset\""), "{html}");
+    assert!(html.contains(&format!("<img src=\"{path}\"")), "{html}");
+    assert_eq!(
+        read_pad(&client, id).await?["text"],
+        format!("![x]({path})")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_pad_takes_rich_as_document() -> TestResult {
     let client = client().await;
 

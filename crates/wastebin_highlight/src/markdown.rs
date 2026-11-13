@@ -9,7 +9,7 @@ use crate::{Highlighter, Html};
 mod document;
 
 pub use document::{
-    editor_html_to_markdown, figure_html, markdown_to_editor_html, text_to_editor_html,
+    Uploads, editor_html_to_markdown, figure_html, markdown_to_editor_html, text_to_editor_html,
 };
 
 /// Render CommonMark `text` to HTML. Fenced code blocks with a known language are syntax

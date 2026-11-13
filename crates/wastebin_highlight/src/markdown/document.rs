@@ -14,7 +14,7 @@ use htmd::element_handler::{HandlerResult, Handlers};
 use htmd::options::BulletListMarker;
 use htmd::{Element, HtmlToMarkdown};
 use markup5ever_rcdom::{Node, NodeData};
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd, html};
+use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
 
 /// Convert the HTML of a document pad (`rich` extension) to the Markdown agents read and write.
 ///
@@ -27,17 +27,29 @@ pub fn editor_html_to_markdown(html: &str) -> String {
 }
 
 /// Convert Markdown written by an agent to sanitized HTML the pad editor accepts as a document
-/// pad (`rich` extension). The inverse of [`editor_html_to_markdown`]. Figures show the sizes in
-/// `sizes`, by path below `/raw/` (`abc.png` → `879 KB`).
+/// pad (`rich` extension). The inverse of [`editor_html_to_markdown`].
 #[must_use]
-pub fn markdown_to_editor_html(markdown: &str, sizes: &HashMap<String, String>) -> String {
+pub fn markdown_to_editor_html(markdown: &str, uploads: &Uploads) -> String {
     let parser = Parser::new_ext(
         markdown,
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH,
     );
     let mut raw = String::with_capacity(markdown.len());
-    html::push_html(&mut raw, editor_events(parser.collect(), sizes).into_iter());
+    html::push_html(
+        &mut raw,
+        editor_events(parser.collect(), uploads).into_iter(),
+    );
     strip_layout_newlines(&sanitizer().clean(&raw).to_string())
+}
+
+/// What [`markdown_to_editor_html`] knows about this server's uploads.
+#[derive(Debug, Default)]
+pub struct Uploads {
+    /// Origin of this server (`https://bin.lan`). Links into it are made relative, so that the
+    /// absolute URL of an upload makes a figure too.
+    pub origin: Option<String>,
+    /// Formatted sizes by path below `/raw/` (`abc.png` → `879 KB`), shown in figures.
+    pub sizes: HashMap<String, String>,
 }
 
 /// The editor's markup for the upload at `/raw/{path}` named `name`, with its formatted `size`
@@ -102,7 +114,12 @@ impl<'a> Asset<'a> {
     }
 }
 
-fn editor_events<'a>(events: Vec<Event<'a>>, sizes: &HashMap<String, String>) -> Vec<Event<'a>> {
+fn editor_events<'a>(events: Vec<Event<'a>>, uploads: &Uploads) -> Vec<Event<'a>> {
+    let events: Vec<Event<'a>> = events
+        .into_iter()
+        .map(|event| relative_link(event, uploads.origin.as_deref()))
+        .collect();
+    let sizes = &uploads.sizes;
     let mut out = Vec::with_capacity(events.len());
     // For each open image: whether it was turned into a link.
     let mut images = Vec::new();
@@ -151,6 +168,43 @@ fn editor_events<'a>(events: Vec<Event<'a>>, sizes: &HashMap<String, String>) ->
     }
 
     out
+}
+
+/// `event` with the URL of a link or image into `origin` made relative.
+fn relative_link<'a>(event: Event<'a>, origin: Option<&str>) -> Event<'a> {
+    let relative = |url: CowStr<'a>| -> CowStr<'a> {
+        match origin.and_then(|origin| url.strip_prefix(origin)) {
+            Some(path) if path.starts_with('/') && !path.starts_with("//") => {
+                path.to_string().into()
+            }
+            _ => url,
+        }
+    };
+    match event {
+        Event::Start(Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Link {
+            link_type,
+            dest_url: relative(dest_url),
+            title,
+            id,
+        }),
+        Event::Start(Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => Event::Start(Tag::Image {
+            link_type,
+            dest_url: relative(dest_url),
+            title,
+            id,
+        }),
+        event => event,
+    }
 }
 
 /// If `events` starts with a paragraph holding only uploaded images and PDF links, return their
@@ -552,7 +606,7 @@ mod tests {
     use super::*;
 
     fn to_html(markdown: &str) -> String {
-        markdown_to_editor_html(markdown, &HashMap::new())
+        markdown_to_editor_html(markdown, &Uploads::default())
     }
 
     /// Markdown that converts to HTML and back unchanged.
@@ -686,12 +740,15 @@ mod tests {
 
     #[test]
     fn figures_show_known_sizes() {
-        let sizes = HashMap::from([
-            ("abc.png".to_string(), "879 KB".to_string()),
-            ("def.pdf".to_string(), "1.2 MB".to_string()),
-        ]);
+        let uploads = Uploads {
+            sizes: HashMap::from([
+                ("abc.png".to_string(), "879 KB".to_string()),
+                ("def.pdf".to_string(), "1.2 MB".to_string()),
+            ]),
+            ..Uploads::default()
+        };
         let html =
-            markdown_to_editor_html("![a.png](/raw/abc.png)\n\n[b.pdf](/raw/def.pdf)", &sizes);
+            markdown_to_editor_html("![a.png](/raw/abc.png)\n\n[b.pdf](/raw/def.pdf)", &uploads);
         assert_eq!(
             html,
             "<figure class=\"inline-asset\" data-kind=\"image\"><img src=\"/raw/abc.png\" alt=\"a.png\">\
@@ -703,6 +760,26 @@ mod tests {
         assert_eq!(
             editor_html_to_markdown(&html),
             "![a.png](/raw/abc.png)\n\n[b.pdf](/raw/def.pdf)"
+        );
+    }
+
+    #[test]
+    fn links_into_this_server_become_relative() {
+        let uploads = Uploads {
+            origin: Some("http://bin.lan".to_string()),
+            ..Uploads::default()
+        };
+        let html = markdown_to_editor_html(
+            "![x](http://bin.lan/raw/abc.png)\n\n[pad](http://bin.lan/pad/abc) \
+             [other](http://bin.lan.evil/raw/abc.png) [same](http://bin.lan//evil.com/x) `http://bin.lan/x`",
+            &uploads,
+        );
+        assert_eq!(
+            html,
+            "<figure class=\"inline-asset\" data-kind=\"image\"><img src=\"/raw/abc.png\" alt=\"x\">\
+             <figcaption>x · <a href=\"/dl/abc.png\">download</a></figcaption></figure>\
+             <p><a href=\"/pad/abc\">pad</a> <a href=\"http://bin.lan.evil/raw/abc.png\">other</a> \
+             <a href=\"http://bin.lan//evil.com/x\">same</a> <code>http://bin.lan/x</code></p>"
         );
     }
 

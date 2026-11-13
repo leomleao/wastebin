@@ -30,7 +30,7 @@ use crate::pads::{PadError, PadResponse, PadWriteRequest, Pads, new_expiration, 
 use crate::{AppState, Page};
 use wastebin_core::db::{self, Database, read::Entry, write};
 use wastebin_core::id::Id;
-use wastebin_highlight::markdown::{editor_html_to_markdown, markdown_to_editor_html};
+use wastebin_highlight::markdown::{Uploads, editor_html_to_markdown, markdown_to_editor_html};
 
 /// Routes of the MCP server, merged into the app outside the timeout and compression layers.
 /// Disabled, `/mcp` is not found instead of being taken for a paste id.
@@ -214,7 +214,7 @@ impl Mcp {
         let req = PadWriteRequest {
             preview: Some(preview(&args.text)),
             content: if document {
-                markdown_to_editor_html(&args.text, &HashMap::new())
+                markdown_to_editor_html(&args.text, &self.uploads(&parts, None).await?)
             } else {
                 args.text
             },
@@ -238,12 +238,16 @@ impl Mcp {
 
     /// Replace a pad's text. Fails with its current text and revision if changed since `revision`.
     #[tool]
-    async fn edit_pad(&self, Parameters(args): Parameters<EditPadArgs>) -> ToolResult {
+    async fn edit_pad(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<EditPadArgs>,
+    ) -> ToolResult {
         let pad = self.pads.get(&args.id).await.map_err(failure)?;
         let (content, extension) = match pad.extension.as_str() {
             "rich" => {
-                let sizes = self.pads.sizes(&pad.id).await.map_err(failure)?;
-                (markdown_to_editor_html(&args.text, &sizes), "rich")
+                let uploads = self.uploads(&parts, Some(&pad.id)).await?;
+                (markdown_to_editor_html(&args.text, &uploads), "rich")
             }
             // Keep detecting the language if it was detected, as the editor does.
             _ if pad.auto_detected => (args.text.clone(), "auto"),
@@ -265,11 +269,15 @@ impl Mcp {
 
     /// Append text to a pad on a new line. Needs no revision: edits made meanwhile are kept.
     #[tool]
-    async fn append_to_pad(&self, Parameters(args): Parameters<AppendArgs>) -> ToolResult {
-        let sizes = self.pads.sizes(&args.id).await.map_err(failure)?;
+    async fn append_to_pad(
+        &self,
+        Extension(parts): Extension<Parts>,
+        Parameters(args): Parameters<AppendArgs>,
+    ) -> ToolResult {
+        let uploads = self.uploads(&parts, Some(&args.id)).await?;
         let pad = self
             .pads
-            .append(&args.id, &args.text, &sizes)
+            .append(&args.id, &args.text, &uploads)
             .await
             .map_err(failure)?;
 
@@ -402,6 +410,19 @@ impl Mcp {
         let host = header("host").unwrap_or("localhost");
         let scheme = header("x-forwarded-proto").unwrap_or("http");
         format!("{scheme}://{host}")
+    }
+
+    /// What document conversion knows about uploads: the origin of this server, and the sizes
+    /// of the files of `pad`.
+    async fn uploads(&self, parts: &Parts, pad: Option<&str>) -> Result<Uploads, CallToolResult> {
+        let sizes = match pad {
+            Some(pad) => self.pads.sizes(pad).await.map_err(failure)?,
+            None => HashMap::new(),
+        };
+        Ok(Uploads {
+            origin: Some(self.base(parts)),
+            sizes,
+        })
     }
 
     /// `expires` if it is one of the configured expiration options.
