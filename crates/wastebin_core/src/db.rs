@@ -170,6 +170,8 @@ pub mod write {
         pub title: Option<Option<String>>,
         /// `Some` resets the expiration (`Some(None)` never expires), `None` keeps it.
         pub expires: Option<Option<NonZeroU32>>,
+        /// Only update if the pad is still at this revision (its `updated_at`).
+        pub base_revision: Option<String>,
     }
 
     /// A compressed entry to be inserted.
@@ -357,6 +359,8 @@ pub mod read {
         pub is_asset: bool,
         /// Entry is a live pad
         pub is_pad: bool,
+        /// Last modification, identifies the revision of a pad
+        pub updated_at: Option<String>,
         /// Entry expiration datetime
         pub expiration: Option<Expiration>,
         /// Entry will be deleted the next time it is fetched via [`Database::get`].
@@ -660,7 +664,7 @@ impl Handler {
 
     fn get_metadata(&self, id: Id) -> Result<Metadata, Error> {
         let metadata = self.conn.query_row(
-            "SELECT uid, title, CAST(ROUND((julianday(expires) - julianday('now')) * 86400) AS INTEGER), burn_after_reading, extension, is_asset, is_pad FROM entries WHERE id=?1",
+            "SELECT uid, title, CAST(ROUND((julianday(expires) - julianday('now')) * 86400) AS INTEGER), burn_after_reading, extension, is_asset, is_pad, updated_at FROM entries WHERE id=?1",
             params![id.to_i64()],
             |row| {
                 let expiration = row.get::<_, Option<i64>>(2)?
@@ -674,6 +678,7 @@ impl Handler {
                     extension: row.get::<_, Option<String>>(4)?,
                     is_asset: row.get::<_, Option<bool>>(5)?.unwrap_or(false),
                     is_pad: row.get::<_, Option<bool>>(6)?.unwrap_or(false),
+                    updated_at: row.get::<_, Option<String>>(7)?,
                     expiration,
                     must_be_deleted: row.get::<_, Option<bool>>(3)?.unwrap_or(false),
                 })
@@ -823,6 +828,11 @@ impl Handler {
         sql.push_str(
             " WHERE id = ?1 AND is_pad = 1 AND (expires IS NULL OR expires > datetime('now'))",
         );
+
+        if let Some(base_revision) = update.base_revision {
+            values.push(Box::new(base_revision));
+            sql.push_str(&format!(" AND updated_at = ?{}", values.len()));
+        }
 
         let affected = self
             .conn
@@ -1149,7 +1159,7 @@ impl Database {
     }
 
     /// Replace the content of the live pad `id` and return its updated metadata. Fails with
-    /// [`Error::NotFound`] if `id` is not a live pad.
+    /// [`Error::NotFound`] if `id` is not a live pad or is no longer at `base_revision`.
     pub async fn update_pad(
         &self,
         id: Id,
@@ -1157,12 +1167,14 @@ impl Database {
         extension: Option<String>,
         title: Option<Option<String>>,
         expires: Option<Option<NonZeroU32>>,
+        base_revision: Option<String>,
     ) -> Result<Metadata, Error> {
         let update = write::PadUpdate {
             data: write::compress_text(text).await?,
             extension,
             title,
             expires,
+            base_revision,
         };
 
         let (result, command_result) = oneshot::channel();
@@ -1555,7 +1567,7 @@ mod tests {
             .await?;
 
         let metadata = db
-            .update_pad(id, "updated", Some("md".to_string()), None, None)
+            .update_pad(id, "updated", Some("md".to_string()), None, None, None)
             .await?;
         assert_eq!(metadata.title.as_deref(), Some("notes"));
         assert!(metadata.expiration.is_some());
@@ -1565,10 +1577,23 @@ mod tests {
         assert_eq!(data.metadata.extension.as_deref(), Some("md"));
 
         let metadata = db
-            .update_pad(id, "updated", None, Some(None), Some(None))
+            .update_pad(id, "updated", None, Some(None), Some(None), None)
             .await?;
         assert_eq!(metadata.title, None);
         assert!(metadata.expiration.is_none());
+
+        // A write based on an outdated revision is refused.
+        let stale = Some("2000-01-01 00:00:00.000".to_string());
+        assert!(matches!(
+            db.update_pad(id, "stale", None, None, None, stale).await,
+            Err(Error::NotFound)
+        ));
+        let current = metadata.updated_at.clone();
+        let metadata = db
+            .update_pad(id, "fresh", None, None, None, current.clone())
+            .await?;
+        assert_ne!(metadata.updated_at, current);
+        assert_eq!(db.get_pad(id).await?.text, "fresh");
 
         Ok(())
     }
@@ -1601,7 +1626,7 @@ mod tests {
         for id in [encrypted, burn, paste, Id::from(12345u32)] {
             assert!(matches!(db.get_pad(id).await, Err(Error::NotFound)));
             assert!(matches!(
-                db.update_pad(id, "clobbered", None, None, None).await,
+                db.update_pad(id, "clobbered", None, None, None, None).await,
                 Err(Error::NotFound)
             ));
             assert!(!db.delete_pad(id).await?);

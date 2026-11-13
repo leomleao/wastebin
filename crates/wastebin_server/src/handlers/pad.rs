@@ -6,6 +6,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::{self, error::RecvError};
@@ -15,7 +16,7 @@ use crate::detect::{detect_language, highlight_code};
 use crate::errors::{Error, JsonError, JsonErrorResponse};
 use crate::{Highlighter, Page};
 use wastebin_core::db::read::{Metadata, PadSummary};
-use wastebin_core::db::{Database, write};
+use wastebin_core::db::{self, Database, write};
 use wastebin_core::id::Id;
 use wastebin_highlight::markdown;
 
@@ -29,10 +30,15 @@ pub struct PadResponse {
     pub extension: String,
     pub detected_lang: String,
     pub is_code: bool,
+    /// Whether `extension` is what auto-detection picks for the content, i.e. the editor can
+    /// keep detecting the language instead of pinning `extension`.
+    pub auto_detected: bool,
     pub highlighted_html: Option<String>,
     pub title: Option<String>,
     /// Seconds until the pad expires, `None` if it never does.
     pub expires_in: Option<u64>,
+    /// Opaque revision, sent back as `base_revision` to detect concurrent writes.
+    pub revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -51,6 +57,10 @@ pub struct PadWriteRequest {
     /// Identifies the writing browser tab, so that it can ignore the echo of its own writes.
     #[serde(default)]
     pub client_id: Option<String>,
+    /// On update, the revision the content is based on. If the pad changed since, the update is
+    /// refused with `409 Conflict` and the current pad.
+    #[serde(default)]
+    pub base_revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -111,6 +121,7 @@ async fn pad_response(
     metadata: &Metadata,
 ) -> PadResponse {
     let detected = detect_language(&content, extension);
+    let auto_detected = detect_language(&content, None).extension == detected.extension;
     let highlighted_html = if detected.is_code {
         highlight_code(highlighter, content.clone(), detected.extension.clone()).await
     } else {
@@ -123,12 +134,14 @@ async fn pad_response(
         extension: detected.extension,
         detected_lang: detected.name,
         is_code: detected.is_code,
+        auto_detected,
         highlighted_html,
         title: metadata.title.clone(),
         expires_in: metadata
             .expiration
             .as_ref()
             .map(|expiration| expiration.duration.as_secs()),
+        revision: metadata.updated_at.clone(),
     }
 }
 
@@ -167,9 +180,11 @@ pub async fn get_latest(
             extension: "auto".to_string(),
             detected_lang: "Auto".to_string(),
             is_code: false,
+            auto_detected: true,
             highlighted_html: None,
             title: None,
             expires_in: None,
+            revision: None,
         }));
     };
 
@@ -267,7 +282,8 @@ pub async fn create_pad(
 }
 
 /// PUT handler replacing the content of a pad. Only the title and expiration present in the
-/// request are changed. Entries that are not pads are reported as not found and left alone.
+/// request are changed. Entries that are not pads are reported as not found and left alone. A
+/// write based on an outdated revision is answered with `409 Conflict` and the current pad.
 pub async fn update_pad(
     State(db): State<Database>,
     State(highlighter): State<Highlighter>,
@@ -275,22 +291,42 @@ pub async fn update_pad(
     State(pad_tx): State<broadcast::Sender<String>>,
     Path(id): Path<String>,
     Json(req): Json<PadWriteRequest>,
-) -> Result<Json<PadResponse>, JsonErrorResponse> {
+) -> Result<Response, JsonErrorResponse> {
     let id = parse_pad_id(&id)?;
     let detected = detect_language(&req.content, req.extension.as_deref());
     let title = req.title.as_deref().map(normalize_title);
     let expires = req.expires.map(NonZeroU32::new);
+    let has_base = req.base_revision.is_some();
 
-    let metadata = db
+    let result = db
         .update_pad(
             id,
             &req.content,
             Some(detected.extension.clone()),
             title,
             expires,
+            req.base_revision,
         )
-        .await
-        .map_err(Error::Database)?;
+        .await;
+
+    let metadata = match result {
+        Ok(metadata) => metadata,
+        Err(db::Error::NotFound) if has_base => {
+            // Either the pad is gone or someone else wrote first.
+            let current = db.get_pad(id).await.map_err(Error::Database)?;
+            let extension = current.metadata.extension.clone();
+            let pad = pad_response(
+                highlighter,
+                id,
+                current.text,
+                extension.as_deref(),
+                &current.metadata,
+            )
+            .await;
+            return Ok((StatusCode::CONFLICT, Json(pad)).into_response());
+        }
+        Err(err) => return Err(Error::Database(err).into()),
+    };
 
     // The paste views never cache pads, but drop anything cached for this id before it became
     // mutable.
@@ -310,7 +346,7 @@ pub async fn update_pad(
         &update_event("update", &pad, req.client_id.as_deref()),
     );
 
-    Ok(Json(pad))
+    Ok(Json(pad).into_response())
 }
 
 /// DELETE handler for a pad. Entries that are not pads are reported as not found and left alone.
@@ -323,7 +359,7 @@ pub async fn delete_pad(
     let id = parse_pad_id(&id)?;
 
     if !db.delete_pad(id).await.map_err(Error::Database)? {
-        return Err(Error::Database(wastebin_core::db::Error::NotFound).into());
+        return Err(Error::Database(db::Error::NotFound).into());
     }
 
     cache.remove(id);
@@ -696,6 +732,47 @@ mod tests {
             rendered.html
         );
         assert!(rendered.html.contains("<em>text</em>"), "{}", rendered.html);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_write_conflicts() -> Result<(), Box<dyn std::error::Error>> {
+        let client = Client::new(StoreCookies(false)).await;
+
+        let created = client
+            .post("/api/pad")
+            .json(&write("base"))
+            .send()
+            .await?
+            .json::<PadResponse>()
+            .await?;
+        let id = created.id.unwrap();
+        let url = format!("/api/pad/{id}");
+
+        let first = client
+            .put(&url)
+            .json(&PadWriteRequest {
+                base_revision: created.revision.clone(),
+                ..write("base + first")
+            })
+            .send()
+            .await?;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        // A second writer still based on the creation is refused and told the current state.
+        let second = client
+            .put(&url)
+            .json(&PadWriteRequest {
+                base_revision: created.revision.clone(),
+                ..write("base + second")
+            })
+            .send()
+            .await?;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        let current = second.json::<PadResponse>().await?;
+        assert_eq!(current.content, "base + first");
+        assert_ne!(current.revision, created.revision);
 
         Ok(())
     }
