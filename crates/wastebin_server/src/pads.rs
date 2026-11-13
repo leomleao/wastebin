@@ -20,7 +20,7 @@ use crate::{AppState, Highlighter, Page};
 use wastebin_core::db::read::{Data, Metadata, PadSummary};
 use wastebin_core::db::{self, Database, write};
 use wastebin_core::id::Id;
-use wastebin_highlight::markdown::markdown_to_editor_html;
+use wastebin_highlight::markdown::{figure_html, markdown_to_editor_html, text_to_editor_html};
 
 /// Number of pads listed by [`Pads::list`].
 const RECENT_PADS: usize = 20;
@@ -281,13 +281,19 @@ impl Pads {
     }
 
     /// Append `text` to pad `id` on a new line, keeping its language, title, expiration and
-    /// label. To a document pad, `text` is Markdown and is appended as HTML blocks. A concurrent
-    /// write is never lost: see [`Pads::rewrite`]. Returns the pad without its content.
-    pub async fn append(&self, id: &str, text: &str) -> Result<PadResponse, PadError> {
+    /// label. To a document pad, `text` is Markdown and is appended as HTML blocks, its figures
+    /// showing the `sizes` of [`Pads::sizes`]. A concurrent write is never lost: see
+    /// [`Pads::rewrite`]. Returns the pad without its content.
+    pub async fn append(
+        &self,
+        id: &str,
+        text: &str,
+        sizes: &HashMap<String, String>,
+    ) -> Result<PadResponse, PadError> {
         self.rewrite(id, |current, extension| {
             let text = if extension == "rich" {
                 // The editor shows every newline: blocks need none between them.
-                format!("{current}{}", markdown_to_editor_html(text))
+                format!("{current}{}", markdown_to_editor_html(text, sizes))
             } else {
                 appended(current, text)
             };
@@ -304,9 +310,10 @@ impl Pads {
             let mut html = if extension == "rich" {
                 current.to_string()
             } else {
-                text_to_doc_html(current)
+                text_to_editor_html(current)
             };
-            html.push_str(&figure_html(file));
+            let size = crate::media::format_size(file.size);
+            html.push_str(&figure_html(&file.path(), &file.name, Some(&size)));
             html.push_str("<div><br></div>");
             (html, "rich".to_string())
         })
@@ -433,6 +440,16 @@ impl Pads {
         Ok(files)
     }
 
+    /// The formatted sizes of the files of pad `id` by path below `/raw/`, as figures show them.
+    pub async fn sizes(&self, id: &str) -> Result<HashMap<String, String>, PadError> {
+        Ok(self
+            .files(id)
+            .await?
+            .into_iter()
+            .map(|file| (file.path(), crate::media::format_size(file.size)))
+            .collect())
+    }
+
     /// Receiver of `{type, id, revision}` JSON for every pad change.
     pub fn subscribe(&self) -> broadcast::Receiver<String> {
         self.events.subscribe()
@@ -498,51 +515,6 @@ fn appended(current: &str, text: &str) -> String {
     } else {
         format!("{current}\n{text}")
     }
-}
-
-/// `text` of a code pad as the lines of a document pad, as the editor converts it.
-fn text_to_doc_html(text: &str) -> String {
-    if text.is_empty() {
-        return String::new();
-    }
-    text.split('\n')
-        .map(|line| match line {
-            "" => "<div><br></div>".to_string(),
-            line => format!("<div>{}</div>", escape_html(line)),
-        })
-        .collect()
-}
-
-/// The editor's markup for `file`: an image, or a PDF the editor embeds, with a caption.
-fn figure_html(file: &PadFile) -> String {
-    let name = escape_html(&file.name);
-    let path = file.path();
-    let size = crate::media::format_size(file.size);
-    let (head, open) = if file.extension == "pdf" {
-        (
-            format!(r#"<figure class="inline-asset" data-kind="pdf" data-src="/raw/{path}">"#),
-            format!(r#"<a href="/raw/{path}">open</a> · "#),
-        )
-    } else {
-        (
-            format!(
-                r#"<figure class="inline-asset" data-kind="image"><img src="/raw/{path}" alt="{name}">"#
-            ),
-            String::new(),
-        )
-    };
-
-    format!(
-        r#"{head}<figcaption>{name} · {size} · {open}<a href="/dl/{path}">download</a></figcaption></figure>"#
-    )
-}
-
-fn escape_html(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 /// Expiration for a new pad: `0` never expires, `None` uses the configured default.
@@ -650,7 +622,7 @@ mod tests {
         assert!(events.recv().await?.contains("\"created\""));
 
         let appended = pads
-            .append(&created.id, "second")
+            .append(&created.id, "second", &HashMap::new())
             .await
             .map_err(|err| format!("{err:?}"))?;
         assert!(appended.revision > created.revision);
@@ -672,7 +644,9 @@ mod tests {
             Some("first")
         );
 
-        let missing = pads.append(&Id::from(12345u32).to_string(), "x").await;
+        let missing = pads
+            .append(&Id::from(12345u32).to_string(), "x", &HashMap::new())
+            .await;
         assert!(matches!(
             missing,
             Err(PadError::Other(Error::Database(db::Error::NotFound)))
@@ -693,7 +667,7 @@ mod tests {
             .map_err(|err| format!("{err:?}"))?;
 
         for text in ["second", "**third**"] {
-            pads.append(&created.id, text)
+            pads.append(&created.id, text, &HashMap::new())
                 .await
                 .map_err(|err| format!("{err:?}"))?;
         }
@@ -741,7 +715,11 @@ mod tests {
         let appends = (0..APPEND_TRIES - 1).map(|n| {
             let pads = pads.clone();
             let id = id.clone();
-            tokio::spawn(async move { pads.append(&id, &format!("line {n}")).await.is_ok() })
+            tokio::spawn(async move {
+                pads.append(&id, &format!("line {n}"), &HashMap::new())
+                    .await
+                    .is_ok()
+            })
         });
         let appends = futures_util::future::join_all(appends).await;
         let edited = edit.await?;
@@ -779,7 +757,7 @@ mod tests {
             .create(write("base"))
             .await
             .map_err(|err| format!("{err:?}"))?;
-        pads.append(&created.id, "more")
+        pads.append(&created.id, "more", &HashMap::new())
             .await
             .map_err(|err| format!("{err:?}"))?;
 

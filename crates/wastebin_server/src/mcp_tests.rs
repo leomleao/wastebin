@@ -933,6 +933,52 @@ async fn document_pads_round_trip_markdown() -> TestResult {
 }
 
 #[tokio::test]
+async fn noop_edit_leaves_an_uploaded_into_code_pad_unchanged() -> TestResult {
+    let client = client().await;
+
+    let code = "fn main() {\n    run();\n}";
+    let pad = create_pad(&client, json!({ "text": code, "language": "rs" })).await?;
+    let id = str_of(&pad, "id");
+    // The upload turns the code pad into a document.
+    call(
+        &client,
+        "upload_file",
+        json!({ "pad": id, "filename": "shot.png", "data_base64": BASE64.encode(PNG) }),
+    )
+    .await?;
+
+    let before = read_pad(&client, id).await?;
+    call(
+        &client,
+        "edit_pad",
+        json!({ "id": id, "text": before["text"], "revision": before["revision"] }),
+    )
+    .await?;
+    let after = read_pad(&client, id).await?;
+    assert_eq!(after["text"], before["text"]);
+    let text = str_of(&after, "text");
+    assert!(
+        text.starts_with("fn main() {\n\u{a0}\u{a0}\u{a0}\u{a0}run();\n}"),
+        "{text}"
+    );
+
+    // The figure keeps its size.
+    let api: Value = client
+        .get(&format!("/api/pad/{id}"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let html = str_of(&api, "content");
+    assert!(
+        html.contains(&format!("shot.png · {} B · ", PNG.len())),
+        "{html}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_pad_takes_rich_as_document() -> TestResult {
     let client = client().await;
 

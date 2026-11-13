@@ -27,16 +27,52 @@ pub fn editor_html_to_markdown(html: &str) -> String {
 }
 
 /// Convert Markdown written by an agent to sanitized HTML the pad editor accepts as a document
-/// pad (`rich` extension). The inverse of [`editor_html_to_markdown`].
+/// pad (`rich` extension). The inverse of [`editor_html_to_markdown`]. Figures show the sizes in
+/// `sizes`, by path below `/raw/` (`abc.png` → `879 KB`).
 #[must_use]
-pub fn markdown_to_editor_html(markdown: &str) -> String {
+pub fn markdown_to_editor_html(markdown: &str, sizes: &HashMap<String, String>) -> String {
     let parser = Parser::new_ext(
         markdown,
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH,
     );
     let mut raw = String::with_capacity(markdown.len());
-    html::push_html(&mut raw, editor_events(parser.collect()).into_iter());
+    html::push_html(&mut raw, editor_events(parser.collect(), sizes).into_iter());
     strip_layout_newlines(&sanitizer().clean(&raw).to_string())
+}
+
+/// The editor's markup for the upload at `/raw/{path}` named `name`, with its formatted `size`
+/// if known (`figureHtml` in the editor).
+#[must_use]
+pub fn figure_html(path: &str, name: &str, size: Option<&str>) -> String {
+    let name = escape_html(if name.trim().is_empty() { path } else { name });
+    let size = size.map_or_else(String::new, |size| format!("{} · ", escape_html(size)));
+    if path.ends_with(".pdf") {
+        format!(
+            "<figure class=\"inline-asset\" data-kind=\"pdf\" data-src=\"/raw/{path}\">\
+             <figcaption>{name} · {size}<a href=\"/raw/{path}\">open</a> · \
+             <a href=\"/dl/{path}\">download</a></figcaption></figure>"
+        )
+    } else {
+        format!(
+            "<figure class=\"inline-asset\" data-kind=\"image\">\
+             <img src=\"/raw/{path}\" alt=\"{name}\">\
+             <figcaption>{name} · {size}<a href=\"/dl/{path}\">download</a></figcaption></figure>"
+        )
+    }
+}
+
+/// The text of a code pad as the lines of a document pad, as the editor converts it.
+#[must_use]
+pub fn text_to_editor_html(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    text.split('\n')
+        .map(|line| match line {
+            "" => "<div><br></div>".to_string(),
+            line => format!("<div>{}</div>", escape_html(line)),
+        })
+        .collect()
 }
 
 // == Markdown to HTML
@@ -61,38 +97,19 @@ impl<'a> Asset<'a> {
         self.path.ends_with(".pdf")
     }
 
-    /// The editor's figure markup (`figureHtml` in the editor), without the file size.
-    fn figure(&self, name: &str) -> String {
-        let name = escape_html(if name.trim().is_empty() {
-            self.path
-        } else {
-            name
-        });
-        let path = self.path;
-        if self.is_pdf() {
-            format!(
-                "<figure class=\"inline-asset\" data-kind=\"pdf\" data-src=\"/raw/{path}\">\
-                 <figcaption>{name} · <a href=\"/raw/{path}\">open</a> · \
-                 <a href=\"/dl/{path}\">download</a></figcaption></figure>"
-            )
-        } else {
-            format!(
-                "<figure class=\"inline-asset\" data-kind=\"image\">\
-                 <img src=\"/raw/{path}\" alt=\"{name}\">\
-                 <figcaption>{name} · <a href=\"/dl/{path}\">download</a></figcaption></figure>"
-            )
-        }
+    fn figure(&self, name: &str, sizes: &HashMap<String, String>) -> String {
+        figure_html(self.path, name, sizes.get(self.path).map(String::as_str))
     }
 }
 
-fn editor_events(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
+fn editor_events<'a>(events: Vec<Event<'a>>, sizes: &HashMap<String, String>) -> Vec<Event<'a>> {
     let mut out = Vec::with_capacity(events.len());
     // For each open image: whether it was turned into a link.
     let mut images = Vec::new();
     let mut i = 0;
 
     while i < events.len() {
-        if let Some((figures, end)) = asset_paragraph(&events[i..]) {
+        if let Some((figures, end)) = asset_paragraph(&events[i..], sizes) {
             out.push(Event::Html(figures.into()));
             i += end + 1;
             continue;
@@ -138,7 +155,10 @@ fn editor_events(events: Vec<Event<'_>>) -> Vec<Event<'_>> {
 
 /// If `events` starts with a paragraph holding only uploaded images and PDF links, return their
 /// figure markup and the index of the paragraph's end.
-fn asset_paragraph(events: &[Event<'_>]) -> Option<(String, usize)> {
+fn asset_paragraph(
+    events: &[Event<'_>],
+    sizes: &HashMap<String, String>,
+) -> Option<(String, usize)> {
     if !matches!(events.first()?, Event::Start(Tag::Paragraph)) {
         return None;
     }
@@ -153,13 +173,13 @@ fn asset_paragraph(events: &[Event<'_>]) -> Option<(String, usize)> {
             Event::Start(Tag::Image { dest_url, .. }) => {
                 let asset = Asset::parse(dest_url)?;
                 let (name, end) = inner_text(&events[i..])?;
-                figures.push_str(&asset.figure(&name));
+                figures.push_str(&asset.figure(&name, sizes));
                 i += end + 1;
             }
             Event::Start(Tag::Link { dest_url, .. }) => {
                 let asset = Asset::parse(dest_url).filter(Asset::is_pdf)?;
                 let (name, end) = inner_text(&events[i..])?;
-                figures.push_str(&asset.figure(&name));
+                figures.push_str(&asset.figure(&name, sizes));
                 i += end + 1;
             }
             _ => return None,
@@ -531,15 +551,19 @@ fn unescape_line(line: &str, out: &mut String) {
 mod tests {
     use super::*;
 
+    fn to_html(markdown: &str) -> String {
+        markdown_to_editor_html(markdown, &HashMap::new())
+    }
+
     /// Markdown that converts to HTML and back unchanged.
     fn assert_round_trip(markdown: &str) {
-        let html = markdown_to_editor_html(markdown);
+        let html = to_html(markdown);
         assert_eq!(editor_html_to_markdown(&html), markdown, "html: {html}");
     }
 
     /// Markdown that converts to `html`, and back unchanged.
     fn assert_converts(markdown: &str, html: &str) {
-        assert_eq!(markdown_to_editor_html(markdown), html);
+        assert_eq!(to_html(markdown), html);
         assert_eq!(editor_html_to_markdown(html), markdown);
     }
 
@@ -564,8 +588,7 @@ mod tests {
 
     #[test]
     fn code_block_keeps_its_newlines() {
-        let html =
-            markdown_to_editor_html("Before\n\n```\nfn main() {\n    run();\n}\n```\n\nAfter");
+        let html = to_html("Before\n\n```\nfn main() {\n    run();\n}\n```\n\nAfter");
         assert_eq!(
             html,
             "<p>Before</p><pre><code>fn main() {\n    run();\n}\n</code></pre><p>After</p>"
@@ -576,7 +599,7 @@ mod tests {
     #[test]
     fn code_block_language_is_dropped() {
         // The editor keeps no attributes on `<code>`.
-        let html = markdown_to_editor_html("```rust\nlet x = 1;\n```");
+        let html = to_html("```rust\nlet x = 1;\n```");
         assert_eq!(editor_html_to_markdown(&html), "```\nlet x = 1;\n```");
     }
 
@@ -619,10 +642,13 @@ mod tests {
         let html = "<div>fn main() {</div><div>    run();</div><div>\tdone();</div><div>}</div>";
         let markdown = editor_html_to_markdown(html);
         let four = "\u{a0}".repeat(4);
-        assert_eq!(markdown, format!("fn main() {{\n{four}run();\n{four}done();\n}}"));
+        assert_eq!(
+            markdown,
+            format!("fn main() {{\n{four}run();\n{four}done();\n}}")
+        );
 
         // A no-op edit keeps the indentation.
-        let html = markdown_to_editor_html(&markdown);
+        let html = to_html(&markdown);
         let four = "&nbsp;".repeat(4);
         assert_eq!(
             html,
@@ -659,19 +685,50 @@ mod tests {
     }
 
     #[test]
+    fn figures_show_known_sizes() {
+        let sizes = HashMap::from([
+            ("abc.png".to_string(), "879 KB".to_string()),
+            ("def.pdf".to_string(), "1.2 MB".to_string()),
+        ]);
+        let html =
+            markdown_to_editor_html("![a.png](/raw/abc.png)\n\n[b.pdf](/raw/def.pdf)", &sizes);
+        assert_eq!(
+            html,
+            "<figure class=\"inline-asset\" data-kind=\"image\"><img src=\"/raw/abc.png\" alt=\"a.png\">\
+             <figcaption>a.png · 879 KB · <a href=\"/dl/abc.png\">download</a></figcaption></figure>\
+             <figure class=\"inline-asset\" data-kind=\"pdf\" data-src=\"/raw/def.pdf\">\
+             <figcaption>b.pdf · 1.2 MB · <a href=\"/raw/def.pdf\">open</a> · \
+             <a href=\"/dl/def.pdf\">download</a></figcaption></figure>"
+        );
+        assert_eq!(
+            editor_html_to_markdown(&html),
+            "![a.png](/raw/abc.png)\n\n[b.pdf](/raw/def.pdf)"
+        );
+    }
+
+    #[test]
+    fn code_text_becomes_editor_lines() {
+        assert_eq!(
+            text_to_editor_html("a\n\n  b<"),
+            "<div>a</div><div><br></div><div>  b&lt;</div>"
+        );
+        assert_eq!(text_to_editor_html(""), "");
+    }
+
+    #[test]
     fn figures_between_text() {
         assert_round_trip(
             "Intro\n\n![a.png](/raw/a.png)\n\n![b.png](/raw/b.png)\n\n[c.pdf](/raw/c.pdf)\n\nOutro",
         );
         // Assets on consecutive lines are one paragraph in Markdown, separate figures here.
-        let html = markdown_to_editor_html("![a.png](/raw/a.png)\n![b.png](/raw/b.png)");
+        let html = to_html("![a.png](/raw/a.png)\n![b.png](/raw/b.png)");
         assert_eq!(html.matches("<figure").count(), 2, "{html}");
         assert!(!html.contains("<p>"), "{html}");
     }
 
     #[test]
     fn figure_without_name_uses_the_file() {
-        let html = markdown_to_editor_html("![](/raw/abc.png)");
+        let html = to_html("![](/raw/abc.png)");
         assert!(html.contains("alt=\"abc.png\""), "{html}");
         assert_eq!(editor_html_to_markdown(&html), "![abc.png](/raw/abc.png)");
     }
@@ -679,7 +736,7 @@ mod tests {
     #[test]
     fn figure_name_is_escaped() {
         assert_round_trip("![a \\[draft\\] \\*v2\\*.png](/raw/abc.png)");
-        let html = markdown_to_editor_html("![<b>x</b>\"y](/raw/abc.png)");
+        let html = to_html("![<b>x</b>\"y](/raw/abc.png)");
         assert!(html.contains("alt=\"x&quot;y\""), "{html}");
     }
 
@@ -713,18 +770,15 @@ mod tests {
     fn foreign_images_become_links() {
         // The editor only shows this server's images.
         assert_eq!(
-            markdown_to_editor_html("![logo](https://example.com/logo.png)"),
+            to_html("![logo](https://example.com/logo.png)"),
             "<p><a href=\"https://example.com/logo.png\">logo</a></p>"
         );
-        assert_eq!(
-            markdown_to_editor_html("![x](//example.com/x.png)"),
-            "<p><a>x</a></p>"
-        );
+        assert_eq!(to_html("![x](//example.com/x.png)"), "<p><a>x</a></p>");
     }
 
     #[test]
     fn output_is_sanitized() {
-        let html = markdown_to_editor_html(
+        let html = to_html(
             "<script>alert(1)</script>\n\n[x](javascript:alert(1)) <img src=x onerror=alert(1)>\n\n\
              <figure class=\"inline-asset evil\" data-kind=\"x\" data-src=\"javascript:x\" onclick=\"x\"></figure>\n\n\
              <span style=\"color:red\">kept</span> <iframe src=\"/raw/a.pdf\"></iframe>",
@@ -749,9 +803,7 @@ mod tests {
 
     #[test]
     fn no_newlines_between_tags() {
-        let html = markdown_to_editor_html(
-            "# A\n\n- b\n- c\n\n| d |\n| - |\n| e |\n\n> f\n\n1. g\n\n   h\n2. i",
-        );
+        let html = to_html("# A\n\n- b\n- c\n\n| d |\n| - |\n| e |\n\n> f\n\n1. g\n\n   h\n2. i");
         assert!(!html.contains('\n'), "{html}");
     }
 
@@ -767,7 +819,7 @@ mod tests {
     #[test]
     fn task_lists_are_text() {
         // The editor has no checkboxes: the markers are kept as text, escaped.
-        let markdown = editor_html_to_markdown(&markdown_to_editor_html("- [x] done\n- [ ] open"));
+        let markdown = editor_html_to_markdown(&to_html("- [x] done\n- [ ] open"));
         assert_eq!(markdown, "- \\[x\\] done\n- \\[ \\] open");
         assert_round_trip(&markdown);
     }
@@ -784,19 +836,16 @@ mod tests {
             "| left | right |\n|:-----|------:|\n| `x` | **y** |",
             "[^1] footnote\n\n[^1]: note",
         ] {
-            let once = editor_html_to_markdown(&markdown_to_editor_html(markdown));
-            let twice = editor_html_to_markdown(&markdown_to_editor_html(&once));
+            let once = editor_html_to_markdown(&to_html(markdown));
+            let twice = editor_html_to_markdown(&to_html(&once));
             assert_eq!(once, twice, "from: {markdown}");
-            assert_eq!(
-                markdown_to_editor_html(&once),
-                markdown_to_editor_html(&twice)
-            );
+            assert_eq!(to_html(&once), to_html(&twice));
         }
     }
 
     #[test]
     fn empty() {
-        assert_eq!(markdown_to_editor_html(""), "");
+        assert_eq!(to_html(""), "");
         assert_eq!(editor_html_to_markdown(""), "");
     }
 }

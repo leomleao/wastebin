@@ -3,12 +3,13 @@
 //! Stateless Streamable HTTP with JSON responses. The tools read and write pads through
 //! [`Pads`], so agent writes reach open editors live, and pastes through the [`Database`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::Router;
+use axum::extract::FromRef;
 use axum::http::StatusCode;
 use axum::routing::any;
-use axum::extract::FromRef;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use http::request::Parts;
@@ -213,7 +214,7 @@ impl Mcp {
         let req = PadWriteRequest {
             preview: Some(preview(&args.text)),
             content: if document {
-                markdown_to_editor_html(&args.text)
+                markdown_to_editor_html(&args.text, &HashMap::new())
             } else {
                 args.text
             },
@@ -240,7 +241,10 @@ impl Mcp {
     async fn edit_pad(&self, Parameters(args): Parameters<EditPadArgs>) -> ToolResult {
         let pad = self.pads.get(&args.id).await.map_err(failure)?;
         let (content, extension) = match pad.extension.as_str() {
-            "rich" => (markdown_to_editor_html(&args.text), "rich"),
+            "rich" => {
+                let sizes = self.pads.sizes(&pad.id).await.map_err(failure)?;
+                (markdown_to_editor_html(&args.text, &sizes), "rich")
+            }
             // Keep detecting the language if it was detected, as the editor does.
             _ if pad.auto_detected => (args.text.clone(), "auto"),
             extension => (args.text.clone(), extension),
@@ -262,9 +266,10 @@ impl Mcp {
     /// Append text to a pad on a new line. Needs no revision: edits made meanwhile are kept.
     #[tool]
     async fn append_to_pad(&self, Parameters(args): Parameters<AppendArgs>) -> ToolResult {
+        let sizes = self.pads.sizes(&args.id).await.map_err(failure)?;
         let pad = self
             .pads
-            .append(&args.id, &args.text)
+            .append(&args.id, &args.text, &sizes)
             .await
             .map_err(failure)?;
 
