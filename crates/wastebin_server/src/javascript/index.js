@@ -787,7 +787,7 @@ async function saveNow(force) {
       markDeleted();
       return;
     }
-    if (resp.status >= 400 && resp.status < 500) {
+    if (resp.status >= 400 && resp.status < 500 && resp.status !== 408 && resp.status !== 429) {
       // Retrying would not help: keep the edits and say why they are not saved.
       keepDirty();
       setStatus(resp.status === 413 ? t("TooLarge") : t("Error"));
@@ -1070,7 +1070,12 @@ async function openPad(id, push) {
 function route() {
   // `/?pad=` links of earlier builds open, and are rewritten to, `/pad/{id}`.
   const path = window.location.pathname.match(/^\/pad\/(.+)$/);
-  const id = path ? decodeURIComponent(path[1]) : new URLSearchParams(window.location.search).get("pad");
+  let id = new URLSearchParams(window.location.search).get("pad");
+  try {
+    if (path) id = decodeURIComponent(path[1]);
+  } catch (_) {
+    id = "-"; // A malformed id: no such pad.
+  }
   if (id) return openPad(id, false);
   if (window.location.pathname === "/new") {
     resetEditor();
@@ -1523,7 +1528,7 @@ $("btn-home").addEventListener("click", (e) => {
 
 btnPreview.addEventListener("click", togglePreview);
 
-// Language and expiration live in a popover behind the cog.
+// Language, expiration and theme live in a disclosure behind the cog.
 const btnSettings = $("btn-settings");
 const settings = $("settings");
 
@@ -1537,7 +1542,10 @@ document.addEventListener("click", (e) => {
   if (!settings.contains(e.target) && !btnSettings.contains(e.target)) showSettings(false);
 });
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") showSettings(false);
+  if (e.key === "Escape" && !settings.classList.contains("hidden")) {
+    showSettings(false);
+    btnSettings.focus();
+  }
 });
 
 // The sidebar collapses; the choice is remembered per browser.

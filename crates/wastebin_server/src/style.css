@@ -1251,6 +1251,10 @@ header {
   border-bottom: none;
 }
 
+.settings-popover .theme-switcher {
+  margin-left: 0;
+}
+
 .sidebar-collapsed > .panel {
   display: none;
 }

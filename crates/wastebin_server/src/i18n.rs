@@ -83,6 +83,7 @@ static EN: phf::Map<&'static str, &'static str> = phf_map! {
     "nav.copy_markdown" => "copy as markdown",
     "nav.settings" => "settings",
     "nav.sidebar" => "sidebar",
+    "index.label.theme" => "theme",
 
     "theme.dark" => "dark mode",
     "theme.light" => "light mode",
@@ -204,6 +205,7 @@ static DE: phf::Map<&'static str, &'static str> = phf_map! {
     "nav.copy_markdown" => "Als Markdown kopieren",
     "nav.settings" => "Einstellungen",
     "nav.sidebar" => "Seitenleiste",
+    "index.label.theme" => "Design",
 
     "theme.dark" => "Dunkler Modus",
     "theme.light" => "Heller Modus",
@@ -325,6 +327,7 @@ static ZH: phf::Map<&'static str, &'static str> = phf_map! {
     "nav.copy_markdown" => "复制为 Markdown",
     "nav.settings" => "设置",
     "nav.sidebar" => "侧边栏",
+    "index.label.theme" => "主题",
 
     "theme.dark" => "深色模式",
     "theme.light" => "浅色模式",
