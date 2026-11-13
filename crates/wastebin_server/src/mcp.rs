@@ -202,7 +202,8 @@ impl Mcp {
         Parameters(args): Parameters<CreatePadArgs>,
     ) -> ToolResult {
         let expires = self.expiration(args.expires)?;
-        let document = args.language.as_deref() == Some("document");
+        // `rich` is what documents are stored as: never take it as editor HTML.
+        let document = matches!(args.language.as_deref(), Some("document" | "rich"));
         let req = PadWriteRequest {
             preview: Some(preview(&args.text)),
             content: if document {

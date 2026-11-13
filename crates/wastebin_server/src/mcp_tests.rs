@@ -933,6 +933,30 @@ async fn document_pads_round_trip_markdown() -> TestResult {
 }
 
 #[tokio::test]
+async fn create_pad_takes_rich_as_document() -> TestResult {
+    let client = client().await;
+
+    let created = create_pad(
+        &client,
+        json!({ "text": "# Title\n\n<script>alert(1)</script>", "language": "rich" }),
+    )
+    .await?;
+    let id = str_of(&created, "id");
+
+    let api: Value = client
+        .get(&format!("/api/pad/{id}"))
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(api["extension"], "rich");
+    assert_eq!(api["content"], "<h1>Title</h1>");
+    assert_eq!(read_pad(&client, id).await?["text"], "# Title");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn mcp_can_be_disabled() -> TestResult {
     let state = state_with("0", false);
     let client = Client::with_state(state, StoreCookies(false), Duration::from_secs(30)).await;
