@@ -129,6 +129,8 @@ pub(crate) enum PadError {
     UnsupportedMedia,
     /// The write is based on an outdated revision. Carries the current pad, loaded.
     Conflict(Box<PadResponse>),
+    /// The pad kept changing while a write retried: try again later.
+    Busy,
     /// Anything else. An unknown pad, or an entry that is not a pad, is
     /// `Error::Database(db::Error::NotFound)`.
     Other(Error),
@@ -304,28 +306,44 @@ impl Pads {
         .await
     }
 
-    /// Add `file`, uploaded into pad `id`, at the end of the pad with the markup the editor
-    /// gives a pasted file. Like the editor, this turns a code pad into a document pad. Returns
-    /// the pad without its content.
-    pub async fn attach(&self, id: &str, file: &PadFile) -> Result<PadResponse, PadError> {
-        self.rewrite(id, |current, extension| {
-            let mut html = if extension == "rich" {
-                current.to_string()
-            } else {
-                text_to_editor_html(current)
-            };
-            let size = crate::media::format_size(file.size);
-            html.push_str(&figure_html(&file.path(), &file.name, Some(&size)));
-            html.push_str("<div><br></div>");
-            (html, "rich".to_string())
-        })
-        .await
+    /// Upload a file into pad `id`, as [`Pads::upload`], and add it at the end of the pad with
+    /// the markup the editor gives a pasted file. Like the editor, this turns a code pad into a
+    /// document pad. If the pad cannot take it, the file is not kept.
+    pub async fn attach(
+        &self,
+        id: &str,
+        mime: &str,
+        filename: Option<&str>,
+        bytes: &[u8],
+    ) -> Result<PadFile, PadError> {
+        let file = self.upload(Some(id), mime, filename, bytes).await?;
+        let size = crate::media::format_size(file.size);
+        let figure = figure_html(&file.path(), &file.name, Some(&size));
+
+        let attached = self
+            .rewrite(id, |current, extension| {
+                let mut html = if extension == "rich" {
+                    current.to_string()
+                } else {
+                    text_to_editor_html(current)
+                };
+                html.push_str(&figure);
+                html.push_str("<div><br></div>");
+                (html, "rich".to_string())
+            })
+            .await;
+        if let Err(err) = attached {
+            self.db.delete_many(vec![file.id]).await?;
+            return Err(err);
+        }
+
+        Ok(file)
     }
 
     /// Replace the content and extension of pad `id` with `change(content, extension)`, keeping
     /// its title, expiration and label. The write is conditional on the content `change` saw, and
-    /// retried on newer content up to a few times before failing with [`PadError::Conflict`], so
-    /// that a concurrent write is never lost.
+    /// retried on newer content up to a few times before failing with [`PadError::Busy`], so that
+    /// a concurrent write is never lost.
     async fn rewrite(
         &self,
         id: &str,
@@ -354,7 +372,8 @@ impl Pads {
             }
         }
 
-        Err(self.conflict(id).await)
+        self.db.get_pad(id).await?;
+        Err(PadError::Busy)
     }
 
     /// Delete pad `id` and the uploads it owns. Entries that are not pads are reported as not
@@ -780,6 +799,122 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rewrite_gives_up_on_a_busy_pad() -> Result<(), Box<dyn std::error::Error>> {
+        let pads = Pads::from_ref(&crate::test_helpers::state());
+        let created = pads
+            .create(write("start"))
+            .await
+            .map_err(|err| format!("{err:?}"))?;
+        let id = parse_pad_id(&created.id)?;
+
+        // Someone else saves between every read and write.
+        let result = pads
+            .rewrite(&created.id, |current, extension| {
+                let save = pads.db.update_pad(
+                    id,
+                    write::PadUpdate {
+                        text: format!("{current}."),
+                        ..Default::default()
+                    },
+                );
+                tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(save))
+                    .expect("save");
+                (format!("{current} lost"), extension.to_string())
+            })
+            .await;
+        assert!(matches!(result, Err(PadError::Busy)), "{result:?}");
+
+        let pad = pads
+            .get(&created.id)
+            .await
+            .map_err(|err| format!("{err:?}"))?;
+        assert_eq!(pad.content.as_deref(), Some("start....."));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn attach_keeps_no_file_it_could_not_add() -> Result<(), Box<dyn std::error::Error>> {
+        let pads = Pads::from_ref(&crate::test_helpers::state());
+        let created = pads
+            .create(write("start"))
+            .await
+            .map_err(|err| format!("{err:?}"))?;
+        let id = parse_pad_id(&created.id)?;
+
+        // Saves in a tight loop make attaching give up.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let savers: Vec<_> = (0..3)
+            .map(|_| {
+                let (db, stop) = (pads.db.clone(), stop.clone());
+                tokio::spawn(async move {
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        // Like an editor: based on what it read, so that it loses nothing.
+                        let current = db.get_pad(id).await.expect("pad");
+                        let update = write::PadUpdate {
+                            text: current.text,
+                            base_revision: current.metadata.updated_at,
+                            ..Default::default()
+                        };
+                        let saved = db.update_pad(id, update).await;
+                        assert!(
+                            matches!(saved, Ok(_) | Err(db::Error::NotFound)),
+                            "save: {saved:?}"
+                        );
+                    }
+                })
+            })
+            .collect();
+        let attaches = (0..8).map(|n| {
+            let pads = pads.clone();
+            let id = created.id.clone();
+            tokio::spawn(async move {
+                let name = format!("{n}.png");
+                pads.attach(&id, "image/png", Some(&name), b"\x89PNG").await
+            })
+        });
+        let attaches = futures_util::future::join_all(attaches).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for saver in savers {
+            saver.await?;
+        }
+
+        let mut added = Vec::new();
+        for attach in attaches {
+            match attach? {
+                Ok(file) => added.push(file.id),
+                Err(PadError::Busy) => {}
+                Err(err) => return Err(format!("{err:?}").into()),
+            }
+        }
+        assert!(
+            added.len() < 8,
+            "no attach gave up: the test proves nothing"
+        );
+
+        // Exactly the added files are kept, and are in the pad.
+        let files = pads
+            .files(&created.id)
+            .await
+            .map_err(|err| format!("{err:?}"))?;
+        let mut kept: Vec<Id> = files.iter().map(|file| file.id).collect();
+        kept.sort_by_key(|id| id.to_i64());
+        added.sort_by_key(|id| id.to_i64());
+        assert_eq!(kept, added);
+        let content = pads
+            .get(&created.id)
+            .await
+            .map_err(|err| format!("{err:?}"))?
+            .content
+            .unwrap_or_default();
+        for file in &files {
+            assert!(content.contains(&file.path()), "{content}");
+        }
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn files_list_the_uploads_of_a_pad() -> Result<(), Box<dyn std::error::Error>> {
         let pads = Pads::from_ref(&crate::test_helpers::state());
@@ -824,20 +959,15 @@ mod tests {
             .await
             .map_err(|err| format!("{err:?}"))?;
         let file = pads
-            .upload(Some(&created.id), "image/png", Some("a\"b.png"), b"\x89PNG")
+            .attach(&created.id, "image/png", Some("a\"b.png"), b"\x89PNG")
             .await
             .map_err(|err| format!("{err:?}"))?;
-
-        let attached = pads
-            .attach(&created.id, &file)
-            .await
-            .map_err(|err| format!("{err:?}"))?;
-        assert_eq!(attached.extension, "rich");
 
         let pad = pads
             .get(&created.id)
             .await
             .map_err(|err| format!("{err:?}"))?;
+        assert_eq!(pad.extension, "rich");
         let path = file.path();
         assert_eq!(
             pad.content.as_deref(),

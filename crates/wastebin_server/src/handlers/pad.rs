@@ -54,6 +54,7 @@ impl IntoResponse for PadError {
                 "only images and PDFs can be uploaded",
             ),
             Self::Conflict(pad) => (StatusCode::CONFLICT, Json(pad)).into_response(),
+            Self::Busy => json_error(StatusCode::SERVICE_UNAVAILABLE, "pad is busy, retry"),
             Self::Other(err) => JsonErrorResponse::from(err).into_response(),
         }
     }

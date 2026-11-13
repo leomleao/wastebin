@@ -303,10 +303,9 @@ impl Mcp {
 
         let file = self
             .pads
-            .upload(Some(&args.pad), mime, Some(&args.filename), &bytes)
+            .attach(&args.pad, mime, Some(&args.filename), &bytes)
             .await
             .map_err(failure)?;
-        self.pads.attach(&args.pad, &file).await.map_err(failure)?;
 
         Ok(CallToolResult::structured(json!({
             "id": file.id.to_string(),
@@ -480,6 +479,7 @@ fn failure(err: PadError) -> CallToolResult {
     match err {
         PadError::Invalid(text) => message(text),
         PadError::UnsupportedMedia => message("only images and PDFs can be uploaded"),
+        PadError::Busy => message("pad is busy, retry"),
         PadError::Conflict(pad) => CallToolResult::structured_error(json!({
             "error": "the pad changed since your revision: merge into text and retry with revision",
             "revision": pad.revision,
@@ -591,6 +591,17 @@ mod tests {
         .await?;
         assert_eq!(result["isError"], false, "{result}");
         Ok(result["structuredContent"].clone())
+    }
+
+    #[test]
+    fn busy_is_a_plain_retry_error() {
+        let result = super::failure(crate::pads::PadError::Busy);
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.structured_content.is_none());
+        assert_eq!(
+            serde_json::to_value(&result.content).ok(),
+            Some(json!([{ "type": "text", "text": "pad is busy, retry" }]))
+        );
     }
 
     #[tokio::test]
