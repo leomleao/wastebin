@@ -50,12 +50,14 @@ pub(crate) fn router(state: AppState) -> Router {
     let base_url = std::env::var(wastebin_core::env::vars::BASE_URL)
         .is_ok()
         .then(|| state.page.base_url.clone());
+    let mut tool_router = Mcp::tool_router();
+    describe_expires(&mut tool_router, &state.page);
     let mcp = Mcp {
         pads: Pads::from_ref(&state),
         db: state.db,
         page: state.page,
         base_url,
-        tool_router: Mcp::tool_router(),
+        tool_router,
     };
     let service = StreamableHttpService::new(
         move || Ok(mcp.clone()),
@@ -64,6 +66,45 @@ pub(crate) fn router(state: AppState) -> Router {
     );
 
     Router::new().nest_service("/mcp", service)
+}
+
+/// Describe the `expires` arguments with the configured expiration options.
+fn describe_expires(tool_router: &mut ToolRouter<Mcp>, page: &Page) {
+    let options: Vec<String> = page
+        .expirations
+        .iter()
+        .map(|expiration| {
+            let secs = expiration.duration.as_secs();
+            let notes: Vec<&str> = [
+                (secs == 0).then_some("never"),
+                expiration.default.then_some("default"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if notes.is_empty() {
+                secs.to_string()
+            } else {
+                format!("{secs} ({})", notes.join(", "))
+            }
+        })
+        .collect();
+    let description = format!("Seconds until it expires, one of: {}.", options.join(", "));
+
+    for tool in ["create_pad", "create_paste"] {
+        let Some(route) = tool_router.map.get_mut(tool) else {
+            continue;
+        };
+        let mut schema = (*route.attr.input_schema).clone();
+        if let Some(expires) = schema
+            .get_mut("properties")
+            .and_then(|properties| properties.get_mut("expires"))
+            .and_then(Value::as_object_mut)
+        {
+            expires.insert("description".to_string(), description.clone().into());
+        }
+        route.attr.input_schema = Arc::new(schema);
+    }
 }
 
 /// Outcome of a tool call: the error branch is reported to the agent as a tool error.
@@ -93,7 +134,7 @@ struct CreatePadArgs {
     title: Option<String>,
     /// `auto` (default), a file extension (`rs`, `md`, …), or `document` for Markdown rich text.
     language: Option<String>,
-    /// Seconds until it expires, one of the server's options (`0` = never). Omit for the default.
+    /// Seconds until it expires. Described with the configured options by `describe_expires`.
     expires: Option<u32>,
 }
 
@@ -131,7 +172,7 @@ struct CreatePasteArgs {
     text: String,
     /// File extension for highlighting (`rs`, `md`, `py`, …). Omit for plain text.
     language: Option<String>,
-    /// Seconds until it expires, one of the server's options (`0` = never). Omit for the default.
+    /// Seconds until it expires. Described with the configured options by `describe_expires`.
     expires: Option<u32>,
     /// Delete the paste after it is read once.
     burn: Option<bool>,

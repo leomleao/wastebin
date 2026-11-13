@@ -345,6 +345,22 @@ async fn create_pad_expiry_follows_the_configured_options() -> TestResult {
         Ok(api["expires_in"].as_u64().unwrap_or(0))
     };
 
+    // Agents learn the options from the tools.
+    let tools = rpc(&client, "tools/list", json!({})).await?;
+    for tool in ["create_pad", "create_paste"] {
+        let tool = tools["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|t| t["name"] == tool)
+            .expect("tool");
+        let expires = str_of(&tool["inputSchema"]["properties"]["expires"], "description");
+        assert_eq!(
+            expires,
+            "Seconds until it expires, one of: 0 (never), 3600 (default), 86400."
+        );
+    }
+
     // The default is the one the UI preselects.
     let pad = create_pad(&client, json!({ "text": "default" })).await?;
     let secs = expires_in(str_of(&pad, "id")).await?;
