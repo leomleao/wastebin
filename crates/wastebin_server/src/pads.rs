@@ -281,16 +281,17 @@ impl Pads {
     }
 
     /// Append `text` to pad `id` on a new line, keeping its language, title, expiration and
-    /// label. To a document pad, `text` is Markdown and is appended as HTML. A concurrent write
-    /// is never lost: see [`Pads::rewrite`]. Returns the pad without its content.
+    /// label. To a document pad, `text` is Markdown and is appended as HTML blocks. A concurrent
+    /// write is never lost: see [`Pads::rewrite`]. Returns the pad without its content.
     pub async fn append(&self, id: &str, text: &str) -> Result<PadResponse, PadError> {
         self.rewrite(id, |current, extension| {
             let text = if extension == "rich" {
-                markdown_to_editor_html(text)
+                // The editor shows every newline: blocks need none between them.
+                format!("{current}{}", markdown_to_editor_html(text))
             } else {
-                text.to_string()
+                appended(current, text)
             };
-            (appended(current, &text), extension.to_string())
+            (text, extension.to_string())
         })
         .await
     }
@@ -676,6 +677,35 @@ mod tests {
             missing,
             Err(PadError::Other(Error::Database(db::Error::NotFound)))
         ));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn append_to_a_document_adds_no_blank_line() -> Result<(), Box<dyn std::error::Error>> {
+        let pads = Pads::from_ref(&crate::test_helpers::state());
+        let created = pads
+            .create(PadWriteRequest {
+                extension: Some("rich".to_string()),
+                ..write("<p>first</p>")
+            })
+            .await
+            .map_err(|err| format!("{err:?}"))?;
+
+        for text in ["second", "**third**"] {
+            pads.append(&created.id, text)
+                .await
+                .map_err(|err| format!("{err:?}"))?;
+        }
+
+        let pad = pads
+            .get(&created.id)
+            .await
+            .map_err(|err| format!("{err:?}"))?;
+        assert_eq!(
+            pad.content.as_deref(),
+            Some("<p>first</p><p>second</p><p><strong>third</strong></p>")
+        );
 
         Ok(())
     }
