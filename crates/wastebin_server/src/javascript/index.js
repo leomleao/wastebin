@@ -1,176 +1,208 @@
+"use strict";
+
 function $(id) {
   return document.getElementById(id);
 }
 
-const clientId = "c_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
-
-// DOM Elements
-const visualEditor = $("visual-editor");
-const codeEditorWrap = $("code-editor-wrap");
-const codeHighlightLayer = $("code-highlight-layer");
-const codeTextarea = $("code-textarea");
-const lineNumbers = $("line-numbers");
-const markdownPreview = $("markdown-preview");
+const root = $("main-container");
 const editorWrap = $("editor-wrap");
-const dropOverlay = $("drop-overlay");
-
-const btnHome = $("btn-home");
-const btnNew = $("btn-new");
-const recentSelect = $("recent-select");
+const codePane = $("code-pane");
+const textarea = $("text");
+const codeHighlight = $("code-highlight");
+const lineNumbers = $("line-numbers");
+const docEditor = $("doc-editor");
+const mdPreview = $("md-preview");
+const overlay = $("drop-overlay");
 const syncStatus = $("sync-status");
-const syncText = $("sync-text");
-const langPill = $("lang-pill");
-const btnCopy = $("btn-copy");
-const btnCopyMd = $("btn-copy-md");
-const btnOpen = $("open");
-const fileInput = $("file-input");
-
-const btnSettings = $("btn-settings");
-const settingsPopover = $("settings-popover");
-const settingExpires = $("setting-expires");
-const settingLang = $("setting-lang");
+const titleInput = $("title");
+const langSelect = $("langs");
+const langFilter = $("filter");
+const padList = $("pad-list");
+const btnPreview = $("btn-preview");
 const btnDownload = $("btn-download");
 const btnRaw = $("btn-raw");
 const btnDelete = $("btn-delete");
-const toastEl = $("toast");
+const padActions = $("pad-actions");
 
-// State
-let currentPadId = null;
-let currentLangSetting = "auto";
-let detectedLang = "txt";
-let currentExpiresSecs = loadSavedExpires();
-let editorMode = "visual"; // "visual" | "code" | "preview"
-let previousEditMode = "visual";
-let saveTimer = null;
-let isSaving = false;
-let pendingSaveAfterCurrent = false;
-let isApplyingRemote = false;
-let lastSavedSignature = "";
-let lastServerRenderedMd = "";
-let editRevision = 0;
+// Localized strings, passed in as `data-i18n-*` attributes.
+function t(key) {
+  return root.dataset["i18n" + key] || "";
+}
 
-// Language display names
-const LANG_NAMES = {
-  auto: "Auto",
-  rich: "Document",
-  html_doc: "Document",
-  js: "JavaScript",
-  javascript: "JavaScript",
-  ts: "TypeScript",
-  typescript: "TypeScript",
-  php: "PHP",
-  abap: "ABAP",
-  md: "Markdown",
-  markdown: "Markdown",
-  py: "Python",
-  python: "Python",
-  sql: "SQL",
-  json: "JSON",
-  html: "HTML",
-  css: "CSS",
-  sh: "Bash",
-  bash: "Bash",
-  rs: "Rust",
-  rust: "Rust",
-  yaml: "YAML",
-  yml: "YAML",
-  txt: "Plain Text",
+const clientId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+const SAVE_DELAY_MS = 250;
+const PAD_LIST_DELAY_MS = 5000;
+
+const state = {
+  padId: null,
+  // "code" edits plain text in the textarea, "doc" edits HTML in the document editor.
+  mode: "code",
+  previewing: false,
+  // Selected language: "auto", "rich" (document) or a file extension.
+  lang: "auto",
+  // Extension the server detected for "auto".
+  detected: "txt",
+  // Content and extension the server last acknowledged for this pad.
+  lastSaved: null,
+  lastSavedExt: null,
+  // Server revision `lastSaved` belongs to; writes based on an older one are refused.
+  revision: null,
+  titleDirty: false,
+  expiryDirty: false,
+  // Seconds until the current pad expires, `null` if it never does.
+  expiresIn: null,
+  saving: false,
+  pending: false,
+  saveTimer: null,
+  // Bumped whenever another pad is shown, so that late responses for the old one are dropped.
+  generation: 0,
+  // Highlighted HTML of each line the server highlighted last, keyed by the line's text.
+  rows: new Map(),
 };
 
-const CODE_LANGS = new Set([
-  "js", "javascript", "ts", "typescript", "php", "abap",
-  "py", "python", "sql", "json", "html", "css", "sh", "bash",
-  "rs", "rust", "yaml", "yml", "c", "cpp", "go", "java", "rb", "toml", "xml"
-]);
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-function loadSavedExpires() {
-  try {
-    const raw = localStorage.getItem("stash_expires");
-    if (raw !== null) {
-      const parsed = parseInt(raw, 10);
-      if (!Number.isNaN(parsed) && parsed >= 0) {
-        return parsed;
-      }
-    }
-  } catch (_) {}
-  return 2592000; // Default: 30 days
-}
-
-function saveExpiresPreference(secs) {
-  currentExpiresSecs = secs;
-  try {
-    localStorage.setItem("stash_expires", String(secs));
-  } catch (_) {}
-}
-
-function initExpirationUI() {
-  if (!settingExpires) return;
-  const radios = settingExpires.querySelectorAll('input[name="stash_expires"]');
-  let matched = false;
-  radios.forEach((r) => {
-    if (parseInt(r.value, 10) === currentExpiresSecs) {
-      r.checked = true;
-      matched = true;
-    } else {
-      r.checked = false;
-    }
-  });
-  if (!matched) {
-    radios.forEach((r) => {
-      if (r.value === "2592000") r.checked = true;
-    });
-  }
-
-  settingExpires.addEventListener("change", (e) => {
-    if (e.target && e.target.name === "stash_expires") {
-      const secs = parseInt(e.target.value, 10);
-      if (!Number.isNaN(secs)) {
-        saveExpiresPreference(secs);
-        if (currentPadId || !isEditorEmpty()) {
-          saveNow();
-        }
-      }
-    }
-  });
-}
-
-let toastTimeout = null;
-function showToast(msg) {
-  if (!toastEl) return;
-  toastEl.textContent = msg;
-  toastEl.classList.remove("hidden");
-  clearTimeout(toastTimeout);
-  toastTimeout = setTimeout(() => {
-    toastEl.classList.add("hidden");
-  }, 2200);
-}
-
-function setSyncStatus(state, label) {
-  if (!syncStatus || !syncText) return;
-  syncStatus.dataset.state = state;
-  syncText.textContent = label;
-}
-
-function escapeHtml(str) {
-  return String(str || "")
+function escapeHtml(text) {
+  return text
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
-function escapeAttr(str) {
-  return escapeHtml(str).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+let toastTimer = null;
+function showToast(text) {
+  const toast = $("toast");
+  if (!toast) return;
+  toast.textContent = text;
+  toast.classList.remove("hidden");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.add("hidden"), 1500);
 }
 
-// ============================================================================
-// Line Numbers & Wrapping Mirror for Code Layer
-// ============================================================================
+function setStatus(text) {
+  syncStatus.textContent = text;
+}
+
+function padUrl(id) {
+  return "/?pad=" + encodeURIComponent(id);
+}
+
+function absoluteUrl(url) {
+  try {
+    return new URL(url, window.location.origin).href;
+  } catch (_) {
+    return url;
+  }
+}
+
+function writeClipboardText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text);
+  }
+  // `navigator.clipboard` only exists in secure contexts, i.e. not on plain-HTTP LAN hosts.
+  const helper = document.createElement("textarea");
+  helper.value = text;
+  helper.setAttribute("readonly", "");
+  helper.className = "clipboard-helper";
+  document.body.appendChild(helper);
+  helper.select();
+  const ok = document.execCommand("copy");
+  helper.remove();
+  return ok ? Promise.resolve() : Promise.reject(new Error("copy failed"));
+}
+
+// ---------------------------------------------------------------------------
+// Sanitizer for document HTML: pasted, loaded from the server or received live.
+// ---------------------------------------------------------------------------
+
+const ALLOWED_TAGS = new Set([
+  "H1", "H2", "H3", "H4", "H5", "H6", "P", "DIV", "BR", "HR",
+  "UL", "OL", "LI", "TABLE", "THEAD", "TBODY", "TFOOT", "TR", "TH", "TD",
+  "STRONG", "EM", "U", "S", "DEL", "SUB", "SUP", "CODE", "PRE", "BLOCKQUOTE",
+  "A", "IMG", "FIGURE", "FIGCAPTION",
+]);
+const RENAMED_TAGS = { B: "strong", I: "em", STRIKE: "s" };
+const DROPPED_TAGS = new Set([
+  "SCRIPT", "STYLE", "IFRAME", "OBJECT", "EMBED", "META", "LINK", "HEAD", "TITLE",
+  "TEMPLATE", "SVG", "MATH", "FORM", "INPUT", "BUTTON", "SELECT", "TEXTAREA", "NOSCRIPT",
+]);
+
+function isSafeHref(href) {
+  return /^(?:https?:|mailto:|\/(?!\/)|#)/i.test(href.trim());
+}
+
+function isAssetUrl(url) {
+  return /^\/raw\/[A-Za-z0-9_-]+(?:\.[A-Za-z0-9]+)?$/.test(url);
+}
+
+function sanitizeNode(node, out) {
+  for (const child of Array.from(node.childNodes)) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      out.appendChild(document.createTextNode(child.nodeValue));
+      continue;
+    }
+    if (child.nodeType !== Node.ELEMENT_NODE) continue;
+
+    const tag = child.tagName.toUpperCase();
+    if (DROPPED_TAGS.has(tag) || child.classList.contains("editor-only")) continue;
+
+    const name = RENAMED_TAGS[tag] || (ALLOWED_TAGS.has(tag) ? tag.toLowerCase() : null);
+    if (!name) {
+      // Unknown wrappers such as <span> or <font>: keep their content only.
+      sanitizeNode(child, out);
+      continue;
+    }
+
+    const el = document.createElement(name);
+
+    if (name === "a") {
+      const href = child.getAttribute("href") || "";
+      if (isSafeHref(href)) el.setAttribute("href", href);
+    } else if (name === "img") {
+      const src = child.getAttribute("src") || "";
+      if (!isAssetUrl(src) && !/^data:image\//i.test(src)) continue;
+      el.setAttribute("src", src);
+      el.setAttribute("alt", child.getAttribute("alt") || "");
+    } else if (name === "figure") {
+      if (child.classList.contains("inline-asset")) {
+        el.className = "inline-asset";
+        const kind = child.getAttribute("data-kind");
+        if (kind === "image" || kind === "pdf") el.setAttribute("data-kind", kind);
+        const src = child.getAttribute("data-src") || "";
+        if (isAssetUrl(src)) el.setAttribute("data-src", src);
+      }
+    } else if (name === "td" || name === "th") {
+      for (const attr of ["colspan", "rowspan"]) {
+        const value = child.getAttribute(attr);
+        if (value && /^\d{1,3}$/.test(value)) el.setAttribute(attr, value);
+      }
+    }
+
+    sanitizeNode(child, el);
+    out.appendChild(el);
+  }
+  return out;
+}
+
+function sanitizeHtml(html) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  return sanitizeNode(doc.body, document.createElement("div"));
+}
+
+// ---------------------------------------------------------------------------
+// Code editor: textarea over a highlighted copy, with a soft-wrap aware gutter.
+// ---------------------------------------------------------------------------
 
 const mirror = document.createElement("div");
 mirror.id = "line-mirror";
 mirror.setAttribute("aria-hidden", "true");
 document.body.appendChild(mirror);
 
+// Properties that influence where the text wraps, copied from the textarea.
 const MIRROR_STYLE = [
   "font",
   "fontFeatureSettings",
@@ -185,31 +217,24 @@ const MIRROR_STYLE = [
 
 const advanceContext = document.createElement("canvas").getContext("2d");
 
+// Upper bound of the width a single code unit adds to a line.
 function unitAdvance(font) {
   advanceContext.font = font;
+  // Wide characters such as CJK, emoji and tab stops advance by at most twice
+  // the step of the font, which covers them with a single bound per code unit.
   return 2 * advanceContext.measureText("M").width;
 }
 
+// Number of visual rows each of `lines` occupies when wrapped as in the textarea.
 function measureRows(lines) {
-  if (!codeTextarea) return new Array(lines.length).fill(1);
-  const style = getComputedStyle(codeTextarea);
-
-  const scrollbar =
-    codeTextarea.offsetWidth - codeTextarea.clientWidth -
-    parseFloat(style.borderLeftWidth || 0) - parseFloat(style.borderRightWidth || 0);
-  const width = Math.max(
-    0,
-    codeTextarea.getBoundingClientRect().width -
-      parseFloat(style.borderLeftWidth || 0) -
-      parseFloat(style.borderRightWidth || 0) -
-      parseFloat(style.paddingLeft || 0) -
-      parseFloat(style.paddingRight || 0) -
-      scrollbar
-  );
+  const style = getComputedStyle(textarea);
+  const width = Math.max(0,
+    textarea.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight));
 
   const rows = new Array(lines.length).fill(1);
-  if (width <= 0) return rows;
 
+  // A line that cannot be wider than the text area cannot wrap either. Only
+  // lay out the remaining ones, so that typing in a long text stays cheap.
   const advance = unitAdvance(style.font);
   const candidateLines = [];
   for (let i = 0; i < lines.length; i++) {
@@ -226,9 +251,10 @@ function measureRows(lines) {
   }
   mirror.style.width = width + "px";
 
+  // The lines are laid out together, so a single layout pass suffices.
   const spans = [];
   const fragment = document.createDocumentFragment();
-  candidateLines.forEach(function (index, i) {
+  candidateLines.forEach(function(index, i) {
     if (i > 0) fragment.appendChild(document.createTextNode("\n"));
     const span = document.createElement("span");
     span.textContent = lines[index];
@@ -237,7 +263,9 @@ function measureRows(lines) {
   });
   mirror.replaceChildren(fragment);
 
-  spans.forEach(function (span, i) {
+  spans.forEach(function(span, i) {
+    // A space hanging at the end of a wrapped row forms a box of its own, so
+    // count the distinct line boxes rather than the client rects.
     const boxes = new Set();
     for (const rect of span.getClientRects()) {
       boxes.add(Math.round(rect.top));
@@ -249,1740 +277,1400 @@ function measureRows(lines) {
 }
 
 function updateLineNumbers() {
-  if (!lineNumbers || !codeTextarea) return;
-  const rows = measureRows(codeTextarea.value.split("\n"));
+  if (state.mode !== "code" || state.previewing) return;
+
+  const rows = measureRows(textarea.value.split("\n"));
   let html = "";
   for (let i = 0; i < rows.length; i++) {
     html += "<div>" + (i + 1) + "</div>";
   }
   lineNumbers.innerHTML = html;
 
+  // Set through the CSSOM: the page's CSP (`style-src 'self' data:`) rejects
+  // `style` attributes coming from markup, which would drop `--rows` again.
   const cells = lineNumbers.children;
   for (let i = 0; i < rows.length; i++) {
-    if (rows[i] > 1 && cells[i]) {
-      cells[i].style.setProperty("--rows", rows[i]);
-    }
-  }
-
-  syncCodeScroll();
-}
-
-function syncCodeScroll() {
-  if (!codeTextarea) return;
-  if (lineNumbers && lineNumbers.scrollTop !== codeTextarea.scrollTop) {
-    lineNumbers.scrollTop = codeTextarea.scrollTop;
-  }
-  if (codeHighlightLayer) {
-    if (codeHighlightLayer.scrollTop !== codeTextarea.scrollTop) {
-      codeHighlightLayer.scrollTop = codeTextarea.scrollTop;
-    }
-    if (codeHighlightLayer.scrollLeft !== codeTextarea.scrollLeft) {
-      codeHighlightLayer.scrollLeft = codeTextarea.scrollLeft;
-    }
+    if (rows[i] > 1) cells[i].style.setProperty("--rows", rows[i]);
   }
 }
 
-if (window.ResizeObserver && codeTextarea) {
-  new ResizeObserver(() => {
-    if (editorMode === "code") updateLineNumbers();
-  }).observe(codeTextarea);
-}
-if (document.fonts && document.fonts.ready) {
-  document.fonts.ready.then(() => {
-    if (editorMode === "code") updateLineNumbers();
+// Remember the server's highlighting of `content`, line by line.
+function setHighlightRows(content, highlightedHtml) {
+  state.rows = new Map();
+  if (!highlightedHtml) return;
+
+  const doc = new DOMParser().parseFromString(highlightedHtml, "text/html");
+  const rows = doc.querySelectorAll('.src-code [id^="LC"]');
+  const lines = content.split("\n");
+  rows.forEach((row, i) => {
+    if (i < lines.length) state.rows.set(lines[i], row.innerHTML);
   });
 }
 
-// ============================================================================
-// Smart Language Detection & Instant Client-Side Syntax Highlighter
-// ============================================================================
-
-function detectLanguageClient(text) {
-  const trimmed = (text || "").trim();
-  if (!trimmed) return "txt";
-
-  // 1. JSON
-  if (
-    (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
-    (trimmed.startsWith("[") && trimmed.endsWith("]"))
-  ) {
-    if (trimmed.includes(":") || trimmed.length > 2) {
-      try {
-        JSON.parse(trimmed);
-        return "json";
-      } catch (_) {}
-    }
-  }
-
-  // 2. PHP
-  if (
-    /<\?(?:php|=)/i.test(trimmed) ||
-    (/(?:^\s*namespace\s+[\w\\]+;|^\s*use\s+[\w\\]+;|\$this->|\$[a-zA-Z_]\w*\s*=)/m.test(trimmed) &&
-      /(?:function\s+\w+|public\s+function|private\s+function|protected\s+function|echo\s+|->|::class)/m.test(trimmed))
-  ) {
-    return "php";
-  }
-
-  // 3. ABAP
-  if (
-    /(?:^\s*REPORT\s+\w+|^\s*DATA:\s*|DATA\(\w+\)|FIELD-SYMBOLS:\s*<\w+>|LOOP\s+AT\s+\w+\s+(?:INTO|ASSIGNING)|ENDLOOP\.|SELECT\s+.*\s+FROM\s+\w+\s+INTO\s+TABLE\s+@?DATA|CALL\s+FUNCTION\s+'|^\s*FORM\s+\w+|^\s*ENDFORM\.|^\s*METHOD\s+\w+|^\s*ENDMETHOD\.|sy-subrc)/im.test(
-      trimmed
-    )
-  ) {
-    return "abap";
-  }
-
-  // 4. HTML
-  if (
-    /^<!DOCTYPE\s+html/i.test(trimmed) ||
-    /^<html[\s>]/i.test(trimmed) ||
-    (/<\/(?:div|section|article|main|header|footer|body|head|script|style|table|ul|ol)>/i.test(trimmed) &&
-      /^<[a-zA-Z][\w-]*/m.test(trimmed))
-  ) {
-    return "html";
-  }
-
-  // 5. SQL
-  if (
-    /^\s*(?:SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|CREATE\s+(?:TABLE|VIEW|INDEX|DATABASE)|ALTER\s+TABLE|DROP\s+TABLE|WITH\s+\w+\s+AS)\b/im.test(
-      trimmed
-    ) &&
-    /\b(?:FROM|WHERE|JOIN|LEFT\s+JOIN|INNER\s+JOIN|GROUP\s+BY|ORDER\s+BY|VALUES|SET|PRIMARY\s+KEY)\b/im.test(
-      trimmed
-    )
-  ) {
-    return "sql";
-  }
-
-  // 6. Rust
-  if (
-    /(?:^\s*(?:pub\s+)?fn\s+\w+|^\s*let\s+mut\s+\w+|^\s*impl(?:<[^>]+>)?\s+\w+|#\[derive\(|use\s+(?:std|crate|super)::|println!\(|Option<|Result<)/m.test(
-      trimmed
-    )
-  ) {
-    return "rs";
-  }
-
-  // 7. TypeScript
-  if (
-    /(?:^\s*(?:export\s+)?(?:interface|type|enum)\s+[A-Z]\w*|:\s*(?:string|number|boolean|any|unknown|void|never|Record<|Promise<|Array<)|\bas\s+const\b|import\s+type\s+)/m.test(
-      trimmed
-    )
-  ) {
-    return "ts";
-  }
-
-  // 8. JavaScript
-  if (
-    /(?:^\s*(?:const|let|var)\s+[\w{[].*=|^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s*\w*\s*\(|=>\s*[{(]|console\.(?:log|error|warn)\(|document\.(?:getElementById|querySelector)|window\.addEventListener|require\(['"]|module\.exports\s*=)/m.test(
-      trimmed
-    )
-  ) {
-    return "js";
-  }
-
-  // 9. Python
-  if (
-    /(?:^\s*(?:async\s+)?def\s+\w+\s*\(.*\)\s*(?:->\s*[\w\[\], ]+)?\s*:|^\s*class\s+\w+(?:\([^)]*\))?\s*:|^\s*from\s+[\w.]+\s+import\s+|if\s+__name__\s*==\s*['"]__main__['"]\s*:|^\s*elif\s+.*:)/m.test(
-      trimmed
-    )
-  ) {
-    return "py";
-  }
-
-  // 10. Bash / Shell
-  if (
-    /^#!\s*\/(?:usr\/bin\/env\s+)?(?:ba|z)?sh/m.test(trimmed) ||
-    /(?:^\s*set\s+-[euo]+|^\s*export\s+[A-Z0-9_]+=|\$\([a-zA-Z0-9_-]+|\b(?:fi|done|esac)\s*$)/m.test(
-      trimmed
-    )
-  ) {
-    return "sh";
-  }
-
-  // 11. CSS
-  if (
-    /(?:^:root\s*\{|@media\s+[^{]+\{|[.#]?[a-zA-Z][\w-]*\s*\{[^}]*\b(?:display|margin|padding|background|color|font-size|border|flex|grid)\s*:)/m.test(
-      trimmed
-    )
-  ) {
-    return "css";
-  }
-
-  // 12. Markdown
-  if (
-    /(?:^#{1,6}\s+\S|^```[\w-]*\s*$|^\s*[-*+]\s+\[[ xX]\]\s+|\[[^\]]+\]\(https?:\/\/[^)]+\)|^\s*>\s+\S)/m.test(
-      trimmed
-    )
-  ) {
-    return "md";
-  }
-
-  // 13. YAML
-  const lines = trimmed.split("\n");
-  if (
-    lines.length >= 2 &&
-    lines.filter((l) => /^[a-zA-Z0-9_-]+:\s*(?:\S.*)?$/.test(l.trim())).length >=
-      Math.min(3, lines.length)
-  ) {
-    return "yaml";
-  }
-
-  return "txt";
+// Lines the server highlighted keep their colors while typing; edited lines show
+// plain until the next save returns.
+function renderHighlight() {
+  const lines = textarea.value.split("\n");
+  let html = lines.map((line) => state.rows.get(line) ?? escapeHtml(line)).join("\n");
+  // A trailing newline only takes up a row in the textarea.
+  if (textarea.value.endsWith("\n")) html += " ";
+  codeHighlight.innerHTML = html;
 }
 
-function highlightCodeClient(code, lang) {
-  if (!code) return "";
-  const normalizedLang = (lang || "txt").toLowerCase();
-
-  if (normalizedLang === "md" || normalizedLang === "markdown") {
-    return code
-      .split("\n")
-      .map((line) => {
-        if (/^#{1,6}\s/.test(line)) {
-          return `<span class="markup heading tok-heading">${escapeHtml(line)}</span>`;
-        }
-        if (/^```/.test(line)) {
-          return `<span class="comment tok-cmt">${escapeHtml(line)}</span>`;
-        }
-        if (/^\s*>\s/.test(line)) {
-          return `<span class="comment tok-cmt">${escapeHtml(line)}</span>`;
-        }
-        return escapeHtml(line)
-          .replace(/(`[^`]+`)/g, '<span class="string tok-str">$1</span>')
-          .replace(/(\*\*[^*]+\*\*)/g, '<span class="keyword tok-kw">$1</span>');
-      })
-      .join("\n");
-  }
-
-  const tokenRegex =
-    /(\/\/[^\n]*|#[^\n]*|--[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\$[a-zA-Z_]\w*|\b(?:0x[0-9a-fA-F]+|\d+(?:\.\d+)?)\b|\b(?:function|const|let|var|return|if|else|elseif|elif|for|while|do|switch|case|break|continue|default|try|catch|finally|throw|new|class|extends|implements|interface|type|enum|export|import|from|as|async|await|yield|static|public|private|protected|readonly|abstract|namespace|use|echo|print|fn|pub|mut|impl|struct|trait|where|match|in|ref|move|Self|self|super|crate|mod|def|lambda|pass|raise|with|global|nonlocal|del|True|False|None|true|false|null|undefined|SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|GROUP|BY|ORDER|HAVING|LIMIT|OFFSET|INSERT|INTO|VALUES|UPDATE|SET|DELETE|CREATE|TABLE|ALTER|DROP|AS|AND|OR|NOT|IN|IS|NULL|DISTINCT|UNION|ALL|REPORT|DATA|TYPES|FIELD-SYMBOLS|LOOP|AT|ENDLOOP|ASSIGNING|FORM|ENDFORM|METHOD|ENDMETHOD|CLASS|ENDCLASS|CALL|FUNCTION|WRITE|APPEND|READ|IF|ELSE|ELSEIF|ENDIF|CASE|WHEN|ENDCASE|PARAMETERS|TABLES|SELECT-OPTIONS)\b|\b[A-Z][A-Za-z0-9_]*\b|\b[a-zA-Z_]\w*(?=\s*\())/g;
-
-  let result = "";
-  let lastIndex = 0;
-  let match;
-
-  while ((match = tokenRegex.exec(code)) !== null) {
-    if (match.index > lastIndex) {
-      result += escapeHtml(code.slice(lastIndex, match.index));
-    }
-    const tok = match[0];
-    let cls = "tok-kw keyword";
-    if (
-      tok.startsWith("//") ||
-      tok.startsWith("#") ||
-      tok.startsWith("--") ||
-      tok.startsWith("/*")
-    ) {
-      cls = "comment line tok-cmt";
-    } else if (
-      tok.startsWith('"') ||
-      tok.startsWith("'") ||
-      tok.startsWith("`")
-    ) {
-      cls = "string quoted tok-str";
-    } else if (tok.startsWith("$")) {
-      cls = "variable other tok-var";
-    } else if (/^(?:0x|\d)/.test(tok)) {
-      cls = "constant numeric tok-num";
-    } else if (
-      code.slice(match.index + tok.length).match(/^\s*\(/) &&
-      !/^(?:if|for|while|switch|catch|return|function|def|fn|match|LOOP|SELECT)$/i.test(tok)
-    ) {
-      cls = "entity name function tok-fn";
-    } else if (/^[A-Z][a-z0-9_]/.test(tok)) {
-      cls = "entity name type tok-type";
-    }
-
-    result += `<span class="${cls}">${escapeHtml(tok)}</span>`;
-    lastIndex = tokenRegex.lastIndex;
-  }
-
-  if (lastIndex < code.length) {
-    result += escapeHtml(code.slice(lastIndex));
-  }
-
-  if (code.endsWith("\n")) {
-    result += "\n";
-  }
-
-  return result;
+function renderCode() {
+  renderHighlight();
+  updateLineNumbers();
+  updateStats();
 }
 
-function updateCodeHighlightLayer(serverHighlightedHtml) {
-  if (!codeHighlightLayer || !codeTextarea) return;
-  const code = codeTextarea.value;
+// ---------------------------------------------------------------------------
+// Document editor
+// ---------------------------------------------------------------------------
 
-  if (serverHighlightedHtml && serverHighlightedHtml.includes('id="LC1"')) {
-    try {
-      const doc = new DOMParser().parseFromString(serverHighlightedHtml, "text/html");
-      const rows = doc.querySelectorAll('[id^="LC"]');
-      const codeLines = code.split("\n");
-      if (rows.length === codeLines.length) {
-        const joined = Array.from(rows)
-          .map((r) => r.innerHTML)
-          .join("\n");
-        codeHighlightLayer.innerHTML = code.endsWith("\n") ? joined + "\n" : joined;
-        syncCodeScroll();
-        return;
+const BLOCK_TAGS = new Set([
+  "DIV", "P", "H1", "H2", "H3", "H4", "H5", "H6", "LI", "TR", "PRE", "BLOCKQUOTE",
+  "FIGURE", "TABLE", "UL", "OL", "HR",
+]);
+
+// Text of a document, one line per block, without inline asset captions.
+function docText(node) {
+  let out = "";
+  const walk = (current) => {
+    for (const child of current.childNodes) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        out += child.nodeValue;
+        continue;
       }
-    } catch (_) {}
-  }
-
-  const effectiveLang =
-    currentLangSetting !== "auto" && currentLangSetting !== "rich"
-      ? currentLangSetting
-      : detectedLang;
-  codeHighlightLayer.innerHTML = highlightCodeClient(code, effectiveLang);
-  syncCodeScroll();
+      if (child.nodeType !== Node.ELEMENT_NODE) continue;
+      if (child.tagName === "FIGURE" || child.classList.contains("editor-only")) continue;
+      if (child.tagName === "BR") {
+        out += "\n";
+        continue;
+      }
+      const block = BLOCK_TAGS.has(child.tagName);
+      if (block && out && !out.endsWith("\n")) out += "\n";
+      walk(child);
+      if (block && out && !out.endsWith("\n")) out += "\n";
+    }
+  };
+  walk(node);
+  return out.replace(/\n$/, "");
 }
 
-// ============================================================================
-// Mode Management: Visual Inline Editor vs Live Code Layer vs Markdown Preview
-// ============================================================================
-
-function hasRichHtmlElements(root) {
-  if (!root) return false;
-  return Boolean(
-    root.querySelector(
-      "figure, img, iframe, .inline-asset, table, h1, h2, h3, h4, h5, h6, ul, ol, blockquote, pre, hr"
-    )
-  );
-}
-
-function extractPlainTextFromVisual() {
-  if (!visualEditor) return "";
-  // Walk child nodes to preserve line breaks accurately
-  const html = visualEditor.innerHTML || "";
-  if (!html || html === "<br>" || html === "<p><br></p>") return "";
-  return visualEditor.innerText.replace(/\r\n/g, "\n");
-}
-
-function setVisualPlainText(text) {
-  if (!visualEditor) return;
-  if (!text) {
-    visualEditor.innerHTML = "";
-    return;
-  }
-  const lines = text.split("\n");
-  visualEditor.innerHTML = lines
-    .map((line) => (line ? `<p>${escapeHtml(line)}</p>` : "<p><br></p>"))
+function textToDocHtml(text) {
+  if (!text) return "";
+  return text
+    .split("\n")
+    .map((line) => "<div>" + (line ? escapeHtml(line) : "<br>") + "</div>")
     .join("");
 }
 
-function updateLangPillUI() {
-  if (!langPill) return;
-  if (editorMode === "preview") {
-    langPill.textContent = "Preview · Click to Edit";
-    langPill.classList.add("preview-active");
-    return;
-  }
-  langPill.classList.remove("preview-active");
+function docHasContent(node) {
+  return docText(node).trim() !== "" || node.querySelector("figure, img, table, hr") !== null;
+}
 
-  if (editorMode === "visual" && hasRichHtmlElements(visualEditor)) {
-    langPill.textContent =
-      currentLangSetting === "auto" ? "Auto: Document" : "Document";
-    return;
-  }
+// Editor-only controls for inline assets: the PDF frame and the remove button.
+function hydrateAssets(node) {
+  for (const figure of node.querySelectorAll("figure.inline-asset")) {
+    figure.contentEditable = "false";
+    const caption = figure.querySelector("figcaption");
 
-  const activeLang =
-    currentLangSetting !== "auto" ? currentLangSetting : detectedLang;
-  const label = LANG_NAMES[activeLang] || activeLang.toUpperCase();
-
-  if (currentLangSetting === "auto") {
-    if (activeLang === "txt" && editorMode === "visual") {
-      langPill.textContent = "Auto: Document";
-    } else {
-      langPill.textContent = "Auto: " + label;
+    const src = figure.getAttribute("data-src");
+    if (figure.getAttribute("data-kind") === "pdf" && src && !figure.querySelector("iframe")) {
+      const frame = document.createElement("iframe");
+      frame.className = "editor-only";
+      frame.src = src;
+      frame.title = caption ? caption.textContent : src;
+      figure.insertBefore(frame, caption);
     }
+
+    if (caption && !caption.querySelector(".asset-remove")) {
+      const wrap = document.createElement("span");
+      wrap.className = "editor-only";
+      wrap.append(" · ");
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "asset-remove";
+      remove.textContent = t("AssetRemove");
+      wrap.appendChild(remove);
+      caption.appendChild(wrap);
+    }
+  }
+}
+
+function setDocHtml(html) {
+  const clean = sanitizeHtml(html);
+  hydrateAssets(clean);
+  docEditor.replaceChildren(...clean.childNodes);
+}
+
+function serializeDoc() {
+  if (!docHasContent(docEditor)) return "";
+  return sanitizeHtml(docEditor.innerHTML).innerHTML;
+}
+
+function figureHtml(asset) {
+  const isPdf = asset.is_pdf;
+  const name = escapeHtml(asset.filename || "");
+  const url = escapeHtml(asset.url);
+  const dl = escapeHtml(asset.dl_url);
+  const links = isPdf
+    ? '<a href="' + url + '">' + escapeHtml(t("AssetOpen")) + "</a> · " +
+      '<a href="' + dl + '">' + escapeHtml(t("AssetDownload")) + "</a>"
+    : '<a href="' + dl + '">' + escapeHtml(t("AssetDownload")) + "</a>";
+  const media = isPdf ? "" : '<img src="' + url + '" alt="' + name + '">';
+  return '<figure class="inline-asset" data-kind="' + (isPdf ? "pdf" : "image") + '"' +
+    (isPdf ? ' data-src="' + url + '"' : "") + ">" + media +
+    "<figcaption>" + name + " · " + escapeHtml(asset.size_formatted || "") + " · " + links +
+    "</figcaption></figure>";
+}
+
+// Character offset of the caret in the document's text, to restore it after a remote update.
+function docCaretOffset() {
+  const selection = window.getSelection();
+  if (!selection.rangeCount || !docEditor.contains(selection.focusNode)) return null;
+  const range = document.createRange();
+  range.setStart(docEditor, 0);
+  range.setEnd(selection.focusNode, selection.focusOffset);
+  return range.toString().length;
+}
+
+function restoreDocCaret(offset) {
+  if (offset === null) return;
+  const walker = document.createTreeWalker(docEditor, NodeFilter.SHOW_TEXT);
+  let remaining = offset;
+  let node = walker.nextNode();
+  while (node) {
+    if (remaining <= node.nodeValue.length) {
+      const selection = window.getSelection();
+      selection.collapse(node, remaining);
+      return;
+    }
+    remaining -= node.nodeValue.length;
+    node = walker.nextNode();
+  }
+}
+
+// Where the next inline asset goes: the caret, or the end of the document.
+function captureInsertRange() {
+  const selection = window.getSelection();
+  if (selection.rangeCount && docEditor.contains(selection.getRangeAt(0).commonAncestorContainer)) {
+    return selection.getRangeAt(0).cloneRange();
+  }
+  const range = document.createRange();
+  range.selectNodeContents(docEditor);
+  range.collapse(false);
+  return range;
+}
+
+function insertNodesAt(range, html) {
+  const holder = document.createElement("div");
+  holder.innerHTML = html;
+  hydrateAssets(holder);
+  const nodes = Array.from(holder.childNodes);
+  if (nodes.length === 0) return;
+
+  // Inline assets are blocks: split them out of the current line.
+  let container = range.startContainer;
+  while (container && container !== docEditor && container.parentNode !== docEditor) {
+    container = container.parentNode;
+  }
+
+  range.deleteContents();
+  const fragment = document.createDocumentFragment();
+  nodes.forEach((node) => fragment.appendChild(node));
+  const inLine = container && container !== docEditor && container.tagName !== "FIGURE";
+  if (inLine && container.nodeType === Node.ELEMENT_NODE && !docHasContent(container)) {
+    // An empty line becomes the asset.
+    container.replaceWith(fragment);
+  } else if (inLine) {
+    container.after(fragment);
   } else {
-    langPill.textContent = label;
+    range.insertNode(fragment);
   }
+
+  // Leave an empty line after the asset to keep typing in.
+  const last = nodes[nodes.length - 1];
+  let next = last.nextSibling;
+  if (!next || next.nodeName === "FIGURE") {
+    next = document.createElement("div");
+    next.appendChild(document.createElement("br"));
+    last.after(next);
+  }
+  const selection = window.getSelection();
+  selection.collapse(next, 0);
 }
 
-function switchToCodeMode(lang, preserveText) {
-  const text =
-    preserveText !== undefined
-      ? preserveText
-      : editorMode === "code"
-      ? codeTextarea.value
-      : extractPlainTextFromVisual();
+// ---------------------------------------------------------------------------
+// Modes and views
+// ---------------------------------------------------------------------------
 
-  editorMode = "code";
-  previousEditMode = "code";
-  if (lang) detectedLang = lang;
-
-  visualEditor.classList.add("hidden");
-  markdownPreview.classList.add("hidden");
-  codeEditorWrap.classList.remove("hidden");
-
-  if (codeTextarea.value !== text) {
-    codeTextarea.value = text;
-  }
-  updateLineNumbers();
-  updateCodeHighlightLayer();
-  updateLangPillUI();
+function effectiveLang() {
+  if (state.mode === "doc") return "rich";
+  return state.lang === "auto" ? state.detected : state.lang;
 }
 
-function switchToVisualMode(wrapExistingCode) {
-  if (editorMode === "code" && wrapExistingCode) {
-    const existingCode = codeTextarea.value.trim();
-    if (existingCode) {
-      visualEditor.innerHTML = `<pre class="code-block"><code>${escapeHtml(existingCode)}</code></pre><p><br></p>`;
-    } else {
-      visualEditor.innerHTML = "";
-    }
-  } else if (editorMode === "code" && !wrapExistingCode) {
-    setVisualPlainText(codeTextarea.value);
-  }
-
-  editorMode = "visual";
-  previousEditMode = "visual";
-
-  codeEditorWrap.classList.add("hidden");
-  markdownPreview.classList.add("hidden");
-  visualEditor.classList.remove("hidden");
-  updateLangPillUI();
+function canPreview() {
+  return state.mode === "code" && effectiveLang() === "md" && state.padId !== null;
 }
 
-function togglePreviewMode() {
-  if (editorMode === "preview") {
-    markdownPreview.classList.add("hidden");
-    if (previousEditMode === "code") {
-      codeEditorWrap.classList.remove("hidden");
-      editorMode = "code";
-      updateLineNumbers();
-    } else {
-      visualEditor.classList.remove("hidden");
-      editorMode = "visual";
-    }
-    updateLangPillUI();
-    return;
-  }
+function updateView() {
+  const previewing = state.previewing && canPreview();
+  codePane.classList.toggle("hidden", state.mode !== "code" || previewing);
+  docEditor.classList.toggle("hidden", state.mode !== "doc");
+  mdPreview.classList.toggle("hidden", !previewing);
 
-  previousEditMode = editorMode;
-  editorMode = "preview";
-  visualEditor.classList.add("hidden");
-  codeEditorWrap.classList.add("hidden");
-  markdownPreview.classList.remove("hidden");
-
-  if (previousEditMode === "visual" && hasRichHtmlElements(visualEditor)) {
-    const clone = visualEditor.cloneNode(true);
-    clone.querySelectorAll(".inline-remove").forEach((b) => b.remove());
-    markdownPreview.innerHTML = clone.innerHTML;
-  } else {
-    const rawText =
-      previousEditMode === "code"
-        ? codeTextarea.value
-        : extractPlainTextFromVisual();
-    markdownPreview.innerHTML =
-      lastServerRenderedMd || renderMarkdownClient(rawText);
-  }
-  updateLangPillUI();
+  btnPreview.classList.toggle("hidden", !canPreview());
+  btnPreview.setAttribute("aria-pressed", String(previewing));
+  const title = previewing ? btnPreview.dataset.titleSource : btnPreview.dataset.titleRendered;
+  btnPreview.title = title;
+  btnPreview.setAttribute("aria-label", title);
+  btnPreview.querySelector(".icon-rendered").classList.toggle("hidden", previewing);
+  btnPreview.querySelector(".icon-source").classList.toggle("hidden", !previewing);
 }
 
-function renderMarkdownClient(md) {
-  if (!md) return "<p><em>Empty pad</em></p>";
-  let html = escapeHtml(md);
-
-  // Fenced code blocks
-  html = html.replace(/```([\w-]*)\n([\s\S]*?)```/g, (_, lang, code) => {
-    return `<pre class="code-block"><code>${code}</code></pre>`;
-  });
-
-  // Images & links
-  html = html.replace(
-    /!\[([^\]]*)\]\(([^)]+)\)/g,
-    '<img src="$2" alt="$1">'
-  );
-  html = html.replace(
-    /\[([^\]]+)\]\(([^)]+)\)/g,
-    '<a href="$2" target="_blank" rel="noopener">$1</a>'
-  );
-
-  // Headings, blockquotes, lists, paragraphs
-  const blocks = html.split(/\n{2,}/);
-  return blocks
-    .map((block) => {
-      if (block.startsWith("<pre ")) return block;
-      if (/^#{1,6}\s/.test(block)) {
-        const m = block.match(/^(#{1,6})\s+(.*)$/);
-        if (m) {
-          const level = m[1].length;
-          return `<h${level}>${formatInlineMd(m[2])}</h${level}>`;
-        }
-      }
-      if (/^>\s/.test(block)) {
-        const inner = block.replace(/^>\s?/gm, "");
-        return `<blockquote><p>${formatInlineMd(inner)}</p></blockquote>`;
-      }
-      if (/^(?:[-*+]\s+.+\n?)+$/.test(block)) {
-        const items = block
-          .split("\n")
-          .filter(Boolean)
-          .map((l) => `<li>${formatInlineMd(l.replace(/^[-*+]\s+/, ""))}</li>`)
-          .join("");
-        return `<ul>${items}</ul>`;
-      }
-      return `<p>${formatInlineMd(block).replace(/\n/g, "<br>")}</p>`;
-    })
-    .join("\n");
+function setMode(mode) {
+  state.mode = mode;
+  if (mode !== "code") state.previewing = false;
+  updateView();
+  if (mode === "code") renderCode();
+  updateStats();
 }
 
-function formatInlineMd(text) {
-  return text
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>");
+function switchToDoc() {
+  if (state.mode === "doc") return;
+  setDocHtml(textToDocHtml(textarea.value));
+  textarea.value = "";
+  state.lang = "rich";
+  selectLang("rich");
+  setMode("doc");
 }
 
-// ============================================================================
-// Serialization & Smart Mode Evaluation
-// ============================================================================
-
-function getSerializedPadContent() {
-  if (editorMode === "code" || (editorMode === "preview" && previousEditMode === "code")) {
-    return codeTextarea.value;
-  }
-  if (hasRichHtmlElements(visualEditor)) {
-    return visualEditor.innerHTML.trim();
-  }
-  return extractPlainTextFromVisual();
-}
-
-function isEditorEmpty() {
-  if (editorMode === "code") {
-    return codeTextarea.value.length === 0;
-  }
-  if (hasRichHtmlElements(visualEditor)) {
+function switchToCode() {
+  if (state.mode === "code") return true;
+  if (docEditor.querySelector("figure.inline-asset") && !window.confirm(t("ConfirmDropAssets"))) {
     return false;
   }
-  return extractPlainTextFromVisual().trim().length === 0;
+  textarea.value = docText(docEditor);
+  docEditor.replaceChildren();
+  state.rows = new Map();
+  setMode("code");
+  return true;
 }
 
-function evaluateSmartModeOnInput() {
-  if (editorMode === "visual") {
-    if (hasRichHtmlElements(visualEditor)) {
-      detectedLang = "rich";
-      updateLangPillUI();
+function selectLang(value) {
+  if (!Array.from(langSelect.options).some((option) => option.value === value)) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    langSelect.options.add(option, 2);
+  }
+  langSelect.value = value;
+}
+
+function updateAutoLabel() {
+  const auto = langSelect.options[0];
+  const detected = state.mode === "code" && state.lang === "auto" && state.detected !== "txt";
+  auto.textContent = detected ? t("Auto") + " · " + state.detected : t("Auto");
+}
+
+// ---------------------------------------------------------------------------
+// Stats
+// ---------------------------------------------------------------------------
+
+const stats = $("stats");
+const MAX_BYTES = parseInt(stats.dataset.maxBytes, 10) || 1024 * 1024;
+const UNIT_KB = stats.dataset.unitKb;
+const UNIT_MB = stats.dataset.unitMb;
+const LABEL_LIMIT = stats.dataset.labelLimit;
+
+function formatSize(bytes) {
+  if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + " " + UNIT_MB;
+  return (bytes / 1024).toFixed(0) + " " + UNIT_KB;
+}
+
+$("progress-limit").textContent = LABEL_LIMIT + " " + formatSize(MAX_BYTES);
+
+function updateStats() {
+  const text = state.mode === "doc" ? docText(docEditor) : textarea.value;
+  const content = state.mode === "doc" ? serializeDoc() : text;
+  const lines = Math.max(1, text.split("\n").length);
+  let bytes;
+  try { bytes = new Blob([content]).size; } catch (_) { bytes = content.length; }
+
+  $("stat-lines").textContent = lines;
+  $("stat-chars").textContent = text.length;
+  $("stat-bytes").textContent = bytes.toLocaleString();
+
+  const pct = Math.min(100, (bytes / MAX_BYTES) * 100);
+  const fill = $("progress-fill");
+  fill.style.width = pct + "%";
+  fill.classList.toggle("warn", pct > 85);
+  $("progress-kb").textContent = (bytes / 1024).toFixed(1) + " " + UNIT_KB;
+}
+
+// ---------------------------------------------------------------------------
+// Pad metadata in the panel
+// ---------------------------------------------------------------------------
+
+const defaultExpiry = document.querySelector('#expiry-list input[name="expires"]:checked');
+
+function selectedExpiry() {
+  const checked = document.querySelector('#expiry-list input[name="expires"]:checked');
+  return checked ? parseInt(checked.value, 10) : 0;
+}
+
+// Show the current pad's expiration as the shortest option that still covers it.
+function syncExpiryRadios() {
+  if (!state.padId) return;
+  const radios = Array.from(document.querySelectorAll('#expiry-list input[name="expires"]'));
+  const remaining = state.expiresIn;
+  const match = remaining === null
+    ? radios.find((radio) => radio.value === "0")
+    : radios
+      .filter((radio) => radio.value !== "0" && parseInt(radio.value, 10) >= remaining)
+      .sort((a, b) => parseInt(a.value, 10) - parseInt(b.value, 10))[0];
+  for (const radio of radios) radio.checked = radio === match;
+}
+
+function updatePadActions() {
+  padActions.classList.toggle("hidden", !state.padId);
+  btnDownload.href = state.padId ? "/dl/" + state.padId : "#";
+  btnRaw.href = state.padId ? "/raw/" + state.padId : "#";
+  for (const item of padList.querySelectorAll(".pad-item")) {
+    item.classList.toggle("active", item.dataset.id === state.padId);
+  }
+}
+
+function relativeTime(iso) {
+  const then = Date.parse(iso || "");
+  if (Number.isNaN(then)) return "";
+  const minutes = Math.floor((Date.now() - then) / 60000);
+  if (minutes < 1) return "<1m";
+  if (minutes < 60) return minutes + "m";
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours + "h";
+  const days = Math.floor(hours / 24);
+  if (days < 30) return days + "d";
+  return new Date(then).toLocaleDateString(document.documentElement.lang);
+}
+
+function renderPads(pads) {
+  if (!Array.isArray(pads)) return;
+  if (pads.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "pad-empty";
+    empty.textContent = t("Empty");
+    padList.replaceChildren(empty);
+    return;
+  }
+
+  padList.replaceChildren(...pads.map((pad) => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "pad-item";
+    item.dataset.id = pad.id;
+    item.dataset.updated = pad.updated_at || "";
+    const label = document.createElement("span");
+    label.className = "pad-label";
+    label.textContent = pad.title || pad.preview || t("Untitled");
+    const time = document.createElement("span");
+    time.className = "pad-time";
+    time.textContent = relativeTime(pad.updated_at);
+    item.append(label, time);
+    item.title = label.textContent;
+    return item;
+  }));
+  updatePadActions();
+}
+
+let padListTimer = null;
+async function refreshPads() {
+  clearTimeout(padListTimer);
+  padListTimer = null;
+  try {
+    const resp = await fetch("/api/pads");
+    if (resp.ok) renderPads(await resp.json());
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+// The list changes with every save somewhere; refresh it at a slow pace.
+function refreshPadsSoon() {
+  if (padListTimer === null) {
+    padListTimer = setTimeout(refreshPads, PAD_LIST_DELAY_MS);
+  }
+}
+
+setInterval(() => {
+  for (const time of padList.querySelectorAll(".pad-item")) {
+    time.querySelector(".pad-time").textContent = relativeTime(time.dataset.updated);
+  }
+}, 60000);
+
+// ---------------------------------------------------------------------------
+// Loading and saving
+// ---------------------------------------------------------------------------
+
+function currentContent() {
+  return state.mode === "doc" ? serializeDoc() : textarea.value;
+}
+
+function currentExtension() {
+  return state.mode === "doc" ? "rich" : state.lang;
+}
+
+function hasUnsavedChanges() {
+  return state.saveTimer !== null || state.saving || state.pending ||
+    currentContent() !== (state.lastSaved ?? "");
+}
+
+function scheduleSave(immediate) {
+  clearTimeout(state.saveTimer);
+  state.saveTimer = null;
+  if (immediate) {
+    saveNow();
+    return;
+  }
+  state.saveTimer = setTimeout(saveNow, SAVE_DELAY_MS);
+}
+
+function onLocalEdit(immediate) {
+  if (state.mode === "doc" && !docHasContent(docEditor) && docEditor.childNodes.length) {
+    // Drop the stray <br> left behind, so that the placeholder shows again.
+    docEditor.replaceChildren();
+  }
+  updateStats();
+  scheduleSave(immediate);
+}
+
+async function saveNow() {
+  clearTimeout(state.saveTimer);
+  state.saveTimer = null;
+
+  if (state.saving) {
+    state.pending = true;
+    return;
+  }
+
+  const content = currentContent();
+  const extension = currentExtension();
+  const isCreate = state.padId === null;
+
+  if (isCreate && content.trim() === "") return;
+  if (!isCreate && content === state.lastSaved && extension === state.lastSavedExt &&
+      !state.titleDirty && !state.expiryDirty) {
+    return;
+  }
+
+  const body = { content, extension, client_id: clientId };
+  if (!isCreate) body.base_revision = state.revision;
+  const sentTitle = isCreate ? titleInput.value.trim() !== "" : state.titleDirty;
+  const sentExpiry = isCreate || state.expiryDirty;
+  if (sentTitle) body.title = titleInput.value;
+  if (sentExpiry) body.expires = selectedExpiry();
+  state.titleDirty = false;
+  state.expiryDirty = false;
+
+  const generation = state.generation;
+  state.saving = true;
+  setStatus(t("Saving"));
+
+  try {
+    const resp = await fetch(isCreate ? "/api/pad" : "/api/pad/" + encodeURIComponent(state.padId), {
+      method: isCreate ? "POST" : "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+
+    if (generation !== state.generation) return;
+
+    if (resp.status === 409) {
+      // Someone else saved first: replay this edit on top of their version and save again.
+      rebase(content, await resp.json());
+      state.titleDirty = state.titleDirty || sentTitle;
+      state.expiryDirty = state.expiryDirty || sentExpiry;
+      state.pending = true;
       return;
     }
+    if (resp.status === 404 && !isCreate) {
+      // The pad was deleted or expired elsewhere: keep the text as a new pad.
+      state.padId = null;
+      state.lastSaved = null;
+      state.titleDirty = titleInput.value.trim() !== "";
+      state.pending = true;
+      return;
+    }
+    if (!resp.ok) throw new Error("save failed: " + resp.status);
 
-    const plain = extractPlainTextFromVisual();
-    if (currentLangSetting !== "auto" && currentLangSetting !== "rich") {
-      if (CODE_LANGS.has(currentLangSetting) || currentLangSetting === "md") {
-        switchToCodeMode(currentLangSetting, plain);
-        codeTextarea.focus();
-        codeTextarea.setSelectionRange(plain.length, plain.length);
-        return;
+    const pad = await resp.json();
+    if (generation !== state.generation) return;
+
+    if (isCreate) {
+      state.padId = pad.id;
+      history.replaceState(null, "", padUrl(pad.id));
+    }
+    state.lastSaved = content;
+    state.lastSavedExt = extension;
+    state.revision = pad.revision;
+    state.expiresIn = pad.expires_in ?? null;
+
+    if (state.mode === "code") {
+      state.detected = pad.extension;
+      if (pad.content === textarea.value || !hasUnsavedChanges()) {
+        setHighlightRows(pad.content, pad.highlighted_html);
+        renderHighlight();
       }
+      updateAutoLabel();
     }
 
-    const guessed = detectLanguageClient(plain);
-    detectedLang = guessed;
-    if (currentLangSetting === "auto" && CODE_LANGS.has(guessed)) {
-      switchToCodeMode(guessed, plain);
-      codeTextarea.focus();
-      codeTextarea.setSelectionRange(plain.length, plain.length);
-      return;
-    }
-    updateLangPillUI();
-  } else if (editorMode === "code") {
-    const code = codeTextarea.value;
-    if (currentLangSetting === "auto") {
-      detectedLang = detectLanguageClient(code);
+    syncExpiryRadios();
+    updatePadActions();
+    updateView();
+    setStatus(t("Saved"));
+
+    if (isCreate || sentTitle) {
+      refreshPads();
     } else {
-      detectedLang = currentLangSetting;
+      refreshPadsSoon();
     }
-    updateLineNumbers();
-    updateCodeHighlightLayer();
-    updateLangPillUI();
+  } catch (err) {
+    console.error(err);
+    if (generation === state.generation) {
+      state.titleDirty = state.titleDirty || sentTitle;
+      state.expiryDirty = state.expiryDirty || (sentExpiry && !isCreate);
+      setStatus(t("Offline"));
+    }
+  } finally {
+    state.saving = false;
+    if (state.pending) {
+      state.pending = false;
+      saveNow();
+    }
   }
 }
 
-// ============================================================================
-// HTML Sanitizer & Rich Paste / Inline Asset Upload
-// ============================================================================
-
-const ALLOWED_TAGS = new Set([
-  "H1", "H2", "H3", "H4", "H5", "H6",
-  "P", "DIV", "SPAN", "BR", "HR",
-  "UL", "OL", "LI",
-  "TABLE", "THEAD", "TBODY", "TFOOT", "TR", "TH", "TD",
-  "STRONG", "B", "EM", "I", "U", "S", "DEL", "STRIKE", "SUB", "SUP",
-  "CODE", "PRE", "BLOCKQUOTE",
-  "A", "IMG", "FIGURE", "FIGCAPTION"
-]);
-
-const FORBIDDEN_TAGS = new Set([
-  "SCRIPT", "STYLE", "IFRAME", "OBJECT", "EMBED", "META", "LINK", "HEAD", "TITLE", "XML", "SVG", "FORM"
-]);
-
-function sanitizePastedHtml(rawHtml) {
-  const parser = new DOMParser();
-  const doc = parser.parseFromString(rawHtml, "text/html");
-
-  function cleanNode(node) {
-    if (node.nodeType === Node.TEXT_NODE) {
-      return document.createTextNode(node.textContent);
+// Wait until everything typed so far reached the server.
+async function flushSave() {
+  for (let i = 0; i < 100 && (state.saveTimer !== null || state.saving || state.pending); i++) {
+    if (state.saving) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    } else {
+      await saveNow();
     }
-    if (node.nodeType !== Node.ELEMENT_NODE) {
-      return null;
-    }
-
-    const tag = node.tagName.toUpperCase();
-    if (FORBIDDEN_TAGS.has(tag) || tag.includes(":")) {
-      return null;
-    }
-
-    // Convert Word MsoListParagraph into <p> or <li>
-    let targetTag = ALLOWED_TAGS.has(tag) ? tag.toLowerCase() : "span";
-    if (tag === "B") targetTag = "strong";
-    if (tag === "I") targetTag = "em";
-
-    const el = document.createElement(targetTag);
-
-    if (targetTag === "a") {
-      const href = node.getAttribute("href") || "";
-      if (href && !/^\s*javascript:/i.test(href)) {
-        el.setAttribute("href", href);
-        el.setAttribute("target", "_blank");
-        el.setAttribute("rel", "noopener");
-      }
-    } else if (targetTag === "img") {
-      const src = node.getAttribute("src") || "";
-      if (src && (/^(?:https?:\/\/|\/|data:image\/)/i.test(src))) {
-        el.setAttribute("src", src);
-        el.setAttribute("alt", node.getAttribute("alt") || "Image");
-      } else {
-        return null;
-      }
-    } else if (targetTag === "td" || targetTag === "th") {
-      const colspan = node.getAttribute("colspan");
-      const rowspan = node.getAttribute("rowspan");
-      if (colspan) el.setAttribute("colspan", colspan);
-      if (rowspan) el.setAttribute("rowspan", rowspan);
-    }
-
-    for (const child of node.childNodes) {
-      const cleanedChild = cleanNode(child);
-      if (cleanedChild) {
-        el.appendChild(cleanedChild);
-      }
-    }
-
-    return el;
   }
-
-  const container = document.createElement("div");
-  for (const child of doc.body.childNodes) {
-    const cleaned = cleanNode(child);
-    if (cleaned) container.appendChild(cleaned);
-  }
-  return container;
 }
 
-function readFileAsDataUrl(file) {
+function resetEditor() {
+  clearTimeout(state.saveTimer);
+  state.saveTimer = null;
+  state.pending = false;
+  state.generation++;
+  state.padId = null;
+  state.previewing = false;
+  state.lang = "auto";
+  state.detected = "txt";
+  state.lastSaved = null;
+  state.lastSavedExt = null;
+  state.revision = null;
+  state.titleDirty = false;
+  state.expiryDirty = false;
+  state.expiresIn = null;
+  state.rows = new Map();
+
+  textarea.value = "";
+  codeHighlight.replaceChildren();
+  docEditor.replaceChildren();
+  mdPreview.replaceChildren();
+  titleInput.value = "";
+  if (defaultExpiry) defaultExpiry.checked = true;
+  langFilter.value = "";
+  filterLangs();
+  selectLang("auto");
+  updateAutoLabel();
+  setMode("code");
+  syncExpiryRadios();
+  updatePadActions();
+  setStatus("");
+}
+
+function newPad() {
+  resetEditor();
+  history.pushState(null, "", "/new");
+  textarea.focus();
+}
+
+function isDocument(pad) {
+  return pad.extension === "rich" ||
+    (pad.extension === "html" && /<(?:figure|img|table|p)[\s>]/i.test(pad.content));
+}
+
+// Show `pad` in the editor. For live updates the caret and scroll position are kept.
+function applyPad(pad, live) {
+  const scrollTop = editorWrap.scrollTop;
+
+  state.padId = pad.id;
+  state.lastSaved = pad.content;
+  state.revision = pad.revision;
+  state.expiresIn = pad.expires_in ?? null;
+  if (!live || document.activeElement !== titleInput) {
+    titleInput.value = pad.title || "";
+    state.titleDirty = false;
+  }
+
+  if (isDocument(pad)) {
+    state.lang = "rich";
+    state.lastSavedExt = "rich";
+    selectLang("rich");
+    const caret = live ? docCaretOffset() : null;
+    if (state.mode !== "doc" || serializeDoc() !== sanitizeHtml(pad.content).innerHTML) {
+      setDocHtml(pad.content);
+      // The sanitized form is what this editor sends back.
+      state.lastSaved = serializeDoc();
+    }
+    setMode("doc");
+    restoreDocCaret(caret);
+  } else {
+    if (!live) {
+      state.lang = pad.auto_detected ? "auto" : pad.extension;
+    } else if (state.lang !== "auto") {
+      state.lang = pad.extension;
+    }
+    state.lastSavedExt = state.lang;
+    state.detected = pad.extension;
+    selectLang(state.lang);
+
+    const before = textarea.value;
+    const focused = document.activeElement === textarea;
+    const [start, end] = [textarea.selectionStart, textarea.selectionEnd];
+    textarea.value = pad.content;
+    setHighlightRows(pad.content, pad.highlighted_html);
+    setMode("code");
+
+    if (live && focused) {
+      textarea.setSelectionRange(shiftOffset(before, pad.content, start),
+        shiftOffset(before, pad.content, end));
+    }
+  }
+
+  updateAutoLabel();
+  syncExpiryRadios();
+  updatePadActions();
+  updateView();
+  if (live) {
+    editorWrap.scrollTop = scrollTop;
+    if (state.previewing) renderPreview();
+  }
+}
+
+// The single region in which `before` and `after` differ: [start, end in before, end in after).
+function changedRegion(before, after) {
+  let start = 0;
+  const max = Math.min(before.length, after.length);
+  while (start < max && before[start] === after[start]) start++;
+  let suffix = 0;
+  while (suffix < max - start &&
+    before[before.length - 1 - suffix] === after[after.length - 1 - suffix]) {
+    suffix++;
+  }
+  return { start, endBefore: before.length - suffix, endAfter: after.length - suffix };
+}
+
+// Map an offset in `before` to `after`, assuming a single edited region.
+function shiftOffset(before, after, offset) {
+  const region = changedRegion(before, after);
+  if (offset <= region.start) return offset;
+  if (offset >= region.endBefore) return offset + after.length - before.length;
+  return region.endAfter;
+}
+
+// Three-way merge of two edits of `base` that touch separate regions, or `null`.
+function merge(base, mine, theirs) {
+  const m = changedRegion(base, mine);
+  const t = changedRegion(base, theirs);
+  const inserted = mine.slice(m.start, m.endAfter);
+  if (m.endBefore <= t.start) {
+    return theirs.slice(0, m.start) + inserted + theirs.slice(m.endBefore);
+  }
+  if (t.endBefore <= m.start) {
+    const delta = theirs.length - base.length;
+    return theirs.slice(0, m.start + delta) + inserted + theirs.slice(m.endBefore + delta);
+  }
+  return null;
+}
+
+// Replay the local edit `mine` (made on top of `state.lastSaved`) onto the newer `pad`. When
+// both touched the same region the local version wins, as it is the one being typed.
+function rebase(mine, pad) {
+  const merged = merge(state.lastSaved ?? "", mine, pad.content) ?? mine;
+  state.lastSaved = pad.content;
+  state.revision = pad.revision;
+  const current = currentContent();
+  // Keep anything typed while the request was in flight.
+  const result = current === mine ? merged : merge(mine, current, merged) ?? current;
+  if (result === current) return;
+
+  if (state.mode === "doc") {
+    const caret = docCaretOffset();
+    setDocHtml(result);
+    restoreDocCaret(caret);
+  } else {
+    const [start, end] = [textarea.selectionStart, textarea.selectionEnd];
+    textarea.value = result;
+    textarea.setSelectionRange(shiftOffset(current, result, start), shiftOffset(current, result, end));
+    renderCode();
+  }
+}
+
+async function openPad(id, push) {
+  await flushSave();
+  resetEditor();
+  const generation = state.generation;
+  try {
+    const resp = await fetch("/api/pad/" + encodeURIComponent(id));
+    if (generation !== state.generation) return;
+    if (!resp.ok) {
+      history.replaceState(null, "", "/new");
+      return;
+    }
+    const pad = await resp.json();
+    if (generation !== state.generation) return;
+    applyPad(pad, false);
+    if (push) {
+      history.pushState(null, "", padUrl(pad.id));
+    } else {
+      history.replaceState(null, "", padUrl(pad.id));
+    }
+  } catch (err) {
+    console.error(err);
+    setStatus(t("Offline"));
+  }
+}
+
+async function openLatest() {
+  await flushSave();
+  resetEditor();
+  const generation = state.generation;
+  try {
+    const resp = await fetch("/api/pad/latest");
+    if (!resp.ok || generation !== state.generation) return;
+    const pad = await resp.json();
+    if (generation !== state.generation || !pad.id) return;
+    applyPad(pad, false);
+    history.replaceState(null, "", padUrl(pad.id));
+  } catch (err) {
+    console.error(err);
+    setStatus(t("Offline"));
+  }
+}
+
+function route() {
+  const id = new URLSearchParams(window.location.search).get("pad");
+  if (id) return openPad(id, false);
+  if (window.location.pathname === "/new") {
+    resetEditor();
+    return Promise.resolve();
+  }
+  return openLatest();
+}
+
+async function renderPreview() {
+  await flushSave();
+  if (!state.padId) return;
+  try {
+    const resp = await fetch("/api/pad/" + encodeURIComponent(state.padId) + "/md");
+    if (!resp.ok) throw new Error("render failed: " + resp.status);
+    const rendered = await resp.json();
+    // Rendered and sanitized by the server.
+    mdPreview.innerHTML = rendered.html;
+  } catch (err) {
+    console.error(err);
+    setStatus(t("Offline"));
+  }
+}
+
+async function togglePreview() {
+  if (state.previewing) {
+    state.previewing = false;
+    updateView();
+    renderCode();
+    textarea.focus();
+    return;
+  }
+  await renderPreview();
+  state.previewing = true;
+  updateView();
+}
+
+// ---------------------------------------------------------------------------
+// Live updates
+// ---------------------------------------------------------------------------
+
+function onPadEvent(event) {
+  let msg;
+  try {
+    msg = JSON.parse(event.data);
+  } catch (_) {
+    return;
+  }
+
+  if (msg.type === "created" || msg.type === "deleted") {
+    refreshPads();
+  } else {
+    refreshPadsSoon();
+  }
+
+  if (msg.client_id === clientId || !msg.id || msg.id !== state.padId) return;
+
+  if (msg.type === "deleted") {
+    // Keep the text: the next edit saves it as a new pad.
+    state.padId = null;
+    state.lastSaved = null;
+    state.expiresIn = null;
+    syncExpiryRadios();
+    updatePadActions();
+    updateView();
+    setStatus(t("Deleted"));
+    return;
+  }
+
+  // Never overwrite local edits that have not reached the server yet; the next save wins.
+  if (hasUnsavedChanges()) return;
+
+  applyPad(msg, true);
+  setStatus(t("Live"));
+}
+
+function connectEvents() {
+  if (!window.EventSource) return;
+  const events = new EventSource("/api/pad/events");
+  let disconnected = false;
+  events.addEventListener("pad_update", onPadEvent);
+  events.addEventListener("error", () => {
+    disconnected = true;
+  });
+  events.addEventListener("open", async () => {
+    if (!disconnected) return;
+    disconnected = false;
+    // Catch up with what happened while the connection was down.
+    refreshPads();
+    if (state.padId && !hasUnsavedChanges()) {
+      const generation = state.generation;
+      const resp = await fetch("/api/pad/" + encodeURIComponent(state.padId));
+      if (resp.ok && generation === state.generation && !hasUnsavedChanges()) {
+        applyPad(await resp.json(), true);
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Files, clipboard and drag & drop
+// ---------------------------------------------------------------------------
+
+function isMediaFile(file) {
+  return /^image\//.test(file.type) || file.type === "application/pdf" ||
+    /\.(?:png|jpe?g|gif|webp|svg|avif|bmp|ico|tiff?|pdf)$/i.test(file.name || "");
+}
+
+function readAsDataUrl(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
-    reader.onload = (e) => resolve(e.target.result);
-    reader.onerror = (err) => reject(err);
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = () => reject(reader.error);
     reader.readAsDataURL(file);
   });
 }
 
-async function uploadAssetDataUrl(dataUrl, filename) {
-  setSyncStatus("saving", "Uploading…");
+function screenshotName(file) {
+  const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return "screenshot " + d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) +
+    " " + pad(d.getHours()) + "." + pad(d.getMinutes()) + "." + pad(d.getSeconds()) + "." + ext;
+}
+
+async function uploadDataUrl(dataUrl, filename) {
   const resp = await fetch("/api/asset", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       data_url: dataUrl,
-      filename: filename || "attachment",
-      expires: currentExpiresSecs,
+      filename,
+      // Assets live as long as the pad that shows them.
+      expires: state.padId ? Math.ceil(state.expiresIn ?? 0) : selectedExpiry(),
     }),
   });
-  if (!resp.ok) {
-    throw new Error("Asset upload failed: " + resp.status);
-  }
-  return await resp.json();
+  if (!resp.ok) throw new Error("upload failed: " + resp.status);
+  return resp.json();
 }
 
-function insertHtmlAtVisualCursor(html) {
-  if (editorMode !== "visual") {
-    switchToVisualMode(true);
-  }
-  visualEditor.focus();
+async function insertAssets(files) {
+  switchToDoc();
+  docEditor.focus();
+  let range = captureInsertRange();
 
-  const sel = window.getSelection();
-  if (sel && sel.rangeCount > 0 && visualEditor.contains(sel.anchorNode)) {
-    const range = sel.getRangeAt(0);
-    range.deleteContents();
-    const temp = document.createElement("div");
-    temp.innerHTML = html;
-    const frag = document.createDocumentFragment();
-    let lastNode = null;
-    while (temp.firstChild) {
-      lastNode = frag.appendChild(temp.firstChild);
-    }
-    range.insertNode(frag);
-    if (lastNode) {
-      const newRange = document.createRange();
-      newRange.setStartAfter(lastNode);
-      newRange.collapse(true);
-      sel.removeAllRanges();
-      sel.addRange(newRange);
-    }
-  } else {
-    visualEditor.insertAdjacentHTML("beforeend", html);
-  }
-}
-
-function buildInlineImageMarkup(res) {
-  const fn = escapeHtml(res.filename || "image.png");
-  const sz = escapeHtml(res.size_formatted || "");
-  return `<figure class="inline-asset inline-image" contenteditable="false"><img src="${escapeAttr(res.url)}" alt="${escapeAttr(res.filename || "image")}"><figcaption>${fn}${sz ? " (" + sz + ")" : ""} <a href="${escapeAttr(res.dl_url)}" download>Download</a> · <button type="button" class="inline-remove">Remove</button></figcaption></figure><p><br></p>`;
-}
-
-function buildInlinePdfMarkup(res) {
-  const fn = escapeHtml(res.filename || "document.pdf");
-  const sz = escapeHtml(res.size_formatted || "");
-  return `<div class="inline-asset inline-pdf" contenteditable="false" data-url="${escapeAttr(res.url)}">
-  <div class="inline-pdf-toolbar">
-    <span>📄 ${fn}${sz ? " (" + sz + ")" : ""}</span>
-    <div class="inline-pdf-actions">
-      <a href="${escapeAttr(res.url)}" target="_blank" rel="noopener">Open in new tab</a>
-      <a href="${escapeAttr(res.dl_url)}" download="${escapeAttr(res.filename || "document.pdf")}">Download PDF</a>
-      <button type="button" class="inline-remove">Remove</button>
-    </div>
-  </div>
-  <iframe class="inline-pdf-frame" src="${escapeAttr(res.url)}#toolbar=1" title="${escapeAttr(res.filename || "document.pdf")}"></iframe>
-</div><p><br></p>`;
-}
-
-function generateScreenshotName(mime) {
-  const d = new Date();
-  const pad = (n) => String(n).padStart(2, "0");
-  const ext = (mime && mime.split("/")[1]) || "png";
-  return `Screenshot ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} at ${pad(d.getHours())}.${pad(d.getMinutes())}.${pad(d.getSeconds())}.${ext}`;
-}
-
-function isImageFile(file) {
-  if (file.type && file.type.startsWith("image/")) return true;
-  return /\.(png|jpe?g|gif|webp|svg|avif|bmp|ico|tiff?)$/i.test(file.name || "");
-}
-
-function isPdfFile(file) {
-  if (file.type === "application/pdf") return true;
-  return /\.pdf$/i.test(file.name || "");
-}
-
-async function handleMediaFileUpload(file) {
-  try {
-    const isImg = isImageFile(file);
-    const filename =
-      file.name || (isImg ? generateScreenshotName(file.type) : "document.pdf");
-    const dataUrl = await readFileAsDataUrl(file);
-    const res = await uploadAssetDataUrl(dataUrl, filename);
-    const markup =
-      res.is_pdf || isPdfFile(file)
-        ? buildInlinePdfMarkup(res)
-        : buildInlineImageMarkup(res);
-    insertHtmlAtVisualCursor(markup);
-    updateLangPillUI();
-    await saveNow();
-  } catch (err) {
-    console.error(err);
-    setSyncStatus("offline", "Upload error");
-    showToast("Failed to upload file");
-  }
-}
-
-async function handleFilesList(fileList) {
-  const files = Array.from(fileList || []);
   for (const file of files) {
-    if (isImageFile(file) || isPdfFile(file)) {
-      await handleMediaFileUpload(file);
+    setStatus(t("Uploading"));
+    try {
+      const asset = await uploadDataUrl(await readAsDataUrl(file), file.name || screenshotName(file));
+      if (!docEditor.contains(range.startContainer)) range = captureInsertRange();
+      insertNodesAt(range, figureHtml(asset));
+      range = captureInsertRange();
+    } catch (err) {
+      console.error(err);
+      showToast(t("UploadFailed"));
+    }
+  }
+
+  onLocalEdit(true);
+}
+
+// Pasted HTML can carry images as `data:` URLs: store them as assets first.
+async function cleanPastedHtml(html) {
+  const clean = sanitizeHtml(html);
+  for (const img of clean.querySelectorAll('img[src^="data:"]')) {
+    try {
+      const asset = await uploadDataUrl(img.getAttribute("src"), img.getAttribute("alt") || "image");
+      const holder = document.createElement("div");
+      holder.innerHTML = figureHtml(asset);
+      img.replaceWith(holder.firstChild);
+    } catch (err) {
+      console.error(err);
+      img.remove();
+    }
+  }
+  return clean.innerHTML;
+}
+
+async function loadTextFile(file) {
+  const text = await file.text();
+  if (textarea.value || docHasContent(docEditor)) {
+    await flushSave();
+    newPad();
+  }
+  switchToCode();
+  textarea.value = text.replace(/\n$/, "");
+
+  const dot = (file.name || "").lastIndexOf(".");
+  const ext = dot > 0 ? file.name.slice(dot + 1).toLowerCase() : "";
+  const known = Array.from(langSelect.options).some((option) => option.value === ext);
+  state.lang = known && ext !== "rich" ? ext : "auto";
+  selectLang(state.lang);
+  langFilter.value = "";
+  filterLangs();
+  if (!titleInput.value) titleInput.value = file.name || "";
+
+  renderCode();
+  updateAutoLabel();
+  onLocalEdit(true);
+}
+
+async function handleFiles(fileList) {
+  const files = Array.from(fileList || []);
+  const media = files.filter(isMediaFile);
+  if (media.length) await insertAssets(media);
+  const text = files.find((file) => !isMediaFile(file));
+  if (text) await loadTextFile(text);
+}
+
+function clipboardFiles(clipboard) {
+  return Array.from(clipboard.files || []).filter(isMediaFile);
+}
+
+textarea.addEventListener("paste", async (e) => {
+  const clipboard = e.clipboardData;
+  if (!clipboard) return;
+
+  const files = clipboardFiles(clipboard);
+  if (files.length && !clipboard.getData("text/plain")) {
+    e.preventDefault();
+    await insertAssets(files);
+    return;
+  }
+
+  // A document with images, tables or headings pasted into an empty pad starts a document.
+  const html = clipboard.getData("text/html");
+  if (html && state.lang === "auto" && textarea.value === "" &&
+      /<(?:img|table|h[1-6])[\s>]/i.test(html)) {
+    e.preventDefault();
+    switchToDoc();
+    docEditor.focus();
+    const clean = await cleanPastedHtml(html);
+    insertNodesAt(captureInsertRange(), clean);
+    onLocalEdit(true);
+  }
+  // Anything else is pasted as plain text by the browser.
+});
+
+docEditor.addEventListener("paste", async (e) => {
+  const clipboard = e.clipboardData;
+  if (!clipboard) return;
+  e.preventDefault();
+
+  const files = clipboardFiles(clipboard);
+  const html = clipboard.getData("text/html");
+  const text = clipboard.getData("text/plain");
+
+  if (files.length && !text) {
+    await insertAssets(files);
+  } else if (html) {
+    const range = captureInsertRange();
+    const clean = await cleanPastedHtml(html);
+    if (/<figure/i.test(clean)) {
+      insertNodesAt(range, clean);
     } else {
-      try {
-        const text = await file.text();
-        const name = file.name || "";
-        const dot = name.lastIndexOf(".");
-        const ext = dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
-        if (ext && CODE_LANGS.has(ext)) {
-          switchToCodeMode(ext, text);
-        } else {
-          if (editorMode === "code") {
-            codeTextarea.value = text;
-          } else {
-            setVisualPlainText(text);
-          }
-          evaluateSmartModeOnInput();
-        }
-        await saveNow();
-      } catch (err) {
-        console.error(err);
-      }
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.execCommand("insertHTML", false, clean);
     }
-  }
-}
-
-// Remove button delegation for inline images & PDFs
-if (visualEditor) {
-  visualEditor.addEventListener("click", (e) => {
-    const removeBtn = e.target.closest(".inline-remove");
-    if (removeBtn) {
-      e.preventDefault();
-      const asset = removeBtn.closest(".inline-asset");
-      if (asset) {
-        asset.remove();
-        updateLangPillUI();
-        saveNow();
-      }
-    }
-  });
-}
-
-// Clipboard Paste Handler (Screenshots, Rich .docx/Word/Docs HTML, Plain Text/Code)
-window.addEventListener("paste", async (e) => {
-  const active = document.activeElement;
-  if (active && active.tagName === "INPUT") {
-    return;
-  }
-
-  const cb = e.clipboardData;
-  if (!cb) return;
-
-  const items = Array.from(cb.items || []);
-  const htmlData = cb.getData("text/html");
-  const textData = cb.getData("text/plain");
-  const imageItem = items.find((item) => item.type && item.type.startsWith("image/"));
-
-  // 1. Direct Screenshot / Image File on Clipboard (no text/html or text/plain)
-  if (imageItem && !htmlData && !textData) {
-    const file = imageItem.getAsFile();
-    if (file) {
-      e.preventDefault();
-      await handleMediaFileUpload(file);
-      return;
-    }
-  }
-
-  // 2. Rich Paste from .docx / Word / Google Docs / Pages (when text/html has semantic formatting or images)
-  const hasRichStructure =
-    htmlData &&
-    /<(?:h[1-6]|table|tr|td|th|ul|ol|li|blockquote|img|figure|strong|b|em|i|u|s|pre|code)\b/i.test(
-      htmlData
-    );
-
-  if (hasRichStructure && (editorMode === "visual" || /<(?:table|img|h[1-6]|ul|ol)\b/i.test(htmlData))) {
-    e.preventDefault();
-    const cleanedContainer = sanitizePastedHtml(htmlData);
-
-    // Upload any embedded data:image/... assets automatically
-    const dataImgs = Array.from(
-      cleanedContainer.querySelectorAll('img[src^="data:image/"]')
-    );
-    for (const img of dataImgs) {
-      try {
-        const res = await uploadAssetDataUrl(
-          img.getAttribute("src"),
-          img.getAttribute("alt") || "pasted-image.png"
-        );
-        img.setAttribute("src", res.url);
-      } catch (_) {}
-    }
-
-    // If HTML had no valid <img> left but clipboard also had an image file (e.g. Word image copy)
-    if (cleanedContainer.querySelectorAll("img").length === 0 && imageItem && !textData.trim()) {
-      const file = imageItem.getAsFile();
-      if (file) {
-        await handleMediaFileUpload(file);
-        return;
-      }
-    }
-
-    insertHtmlAtVisualCursor(cleanedContainer.innerHTML);
-    updateLangPillUI();
-    scheduleSave(true);
-    return;
-  }
-
-  // 3. Plain Text / Code Paste inside Visual Editor
-  if (editorMode === "visual" && textData) {
-    e.preventDefault();
-    if (!hasRichHtmlElements(visualEditor)) {
-      const existingText = extractPlainTextFromVisual();
-      const combined = existingText ? existingText + textData : textData;
-      const guessed =
-        currentLangSetting !== "auto" && currentLangSetting !== "rich"
-          ? currentLangSetting
-          : detectLanguageClient(combined);
-
-      if (CODE_LANGS.has(guessed)) {
-        switchToCodeMode(guessed, combined);
-        codeTextarea.focus();
-        scheduleSave();
-        return;
-      }
-    }
-
-    // Insert plain text preserving line breaks in Visual Editor
-    const htmlLines = textData
-      .replace(/\r\n/g, "\n")
-      .split("\n")
-      .map((line) => (line ? escapeHtml(line) : "<br>"))
-      .join("<br>");
-    insertHtmlAtVisualCursor(htmlLines);
-    evaluateSmartModeOnInput();
-    scheduleSave();
+    onLocalEdit();
+  } else if (text) {
+    // Inserted at the caret, replacing the selection, as part of the undo history.
+    document.execCommand("insertText", false, text.replace(/\r\n?/g, "\n"));
   }
 });
 
-// Drag & Drop Support
+docEditor.addEventListener("click", (e) => {
+  const remove = e.target.closest(".asset-remove");
+  if (!remove) return;
+  e.preventDefault();
+  const figure = remove.closest("figure");
+  if (figure) figure.remove();
+  onLocalEdit(true);
+});
+
 let dragCounter = 0;
-if (editorWrap) {
-  editorWrap.addEventListener("dragenter", (e) => {
-    e.preventDefault();
-    dragCounter++;
-    if (dropOverlay) dropOverlay.classList.add("active");
-  });
+const editorArea = editorWrap.parentElement;
 
-  editorWrap.addEventListener("dragleave", (e) => {
-    e.preventDefault();
-    dragCounter--;
-    if (dragCounter <= 0) {
-      dragCounter = 0;
-      if (dropOverlay) dropOverlay.classList.remove("active");
-    }
-  });
-
-  editorWrap.addEventListener("dragover", (e) => {
-    e.preventDefault();
-  });
-
-  editorWrap.addEventListener("drop", async (e) => {
-    e.preventDefault();
-    dragCounter = 0;
-    if (dropOverlay) dropOverlay.classList.remove("active");
-    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      await handleFilesList(e.dataTransfer.files);
-    }
-  });
+function isFileDrag(e) {
+  return e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files");
 }
 
-if (btnOpen && fileInput) {
-  btnOpen.addEventListener("click", () => {
-    fileInput.value = "";
-    fileInput.click();
-  });
-  fileInput.addEventListener("change", async (e) => {
-    if (e.target.files && e.target.files.length > 0) {
-      await handleFilesList(e.target.files);
-    }
-  });
+editorArea.addEventListener("dragenter", (e) => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  dragCounter++;
+  overlay.classList.add("active");
+});
+
+editorArea.addEventListener("dragleave", (e) => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  dragCounter = Math.max(0, dragCounter - 1);
+  if (dragCounter === 0) overlay.classList.remove("active");
+});
+
+editorArea.addEventListener("dragover", (e) => {
+  if (isFileDrag(e)) e.preventDefault();
+});
+
+editorArea.addEventListener("drop", (e) => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();
+  dragCounter = 0;
+  overlay.classList.remove("active");
+  handleFiles(e.dataTransfer.files);
+});
+
+$("open").addEventListener("click", () => {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.multiple = true;
+  input.addEventListener("change", () => handleFiles(input.files));
+  input.click();
+});
+
+// ---------------------------------------------------------------------------
+// Copying
+// ---------------------------------------------------------------------------
+
+function docForExport() {
+  const clone = sanitizeHtml(docEditor.innerHTML);
+  for (const img of clone.querySelectorAll("img[src]")) img.src = absoluteUrl(img.getAttribute("src"));
+  for (const a of clone.querySelectorAll("a[href]")) a.href = absoluteUrl(a.getAttribute("href"));
+  return clone;
 }
 
-// ============================================================================
-// Copy to Clipboard (Word / Google Docs Rich HTML + Clean Markdown)
-// ============================================================================
-
-function toAbsoluteUrl(url) {
-  if (!url) return "";
+async function copyContent() {
   try {
-    return new URL(url, window.location.origin).href;
-  } catch (_) {
-    return url;
-  }
-}
-
-async function copyRichOrCode() {
-  try {
-    if (editorMode === "code" || (editorMode === "preview" && previousEditMode === "code")) {
-      await navigator.clipboard.writeText(codeTextarea.value);
-      showToast("Copied code to clipboard");
-      return;
-    }
-
-    const clone = visualEditor.cloneNode(true);
-    clone.querySelectorAll(".inline-remove").forEach((b) => b.remove());
-    clone.querySelectorAll("img[src]").forEach((img) => {
-      img.setAttribute("src", toAbsoluteUrl(img.getAttribute("src")));
-    });
-    clone.querySelectorAll("a[href]").forEach((a) => {
-      a.setAttribute("href", toAbsoluteUrl(a.getAttribute("href")));
-    });
-    clone.querySelectorAll(".inline-pdf").forEach((pdfCard) => {
-      const url = toAbsoluteUrl(pdfCard.dataset.url || "");
-      const p = document.createElement("p");
-      const link = document.createElement("a");
-      link.href = url;
-      link.textContent = "📄 PDF Document (" + url + ")";
-      p.appendChild(link);
-      pdfCard.replaceWith(p);
-    });
-
-    const htmlContent = clone.innerHTML;
-    const plainContent = extractPlainTextFromVisual();
-
-    if (navigator.clipboard && window.ClipboardItem) {
-      const item = new ClipboardItem({
-        "text/html": new Blob([htmlContent], { type: "text/html" }),
-        "text/plain": new Blob([plainContent], { type: "text/plain" }),
-      });
-      await navigator.clipboard.write([item]);
-      showToast("Copied (Word / Docs ready)");
+    if (state.mode === "code") {
+      await writeClipboardText(textarea.value);
+    } else if (navigator.clipboard && window.ClipboardItem && window.isSecureContext) {
+      await navigator.clipboard.write([new ClipboardItem({
+        "text/html": new Blob([docForExport().innerHTML], { type: "text/html" }),
+        "text/plain": new Blob([docText(docEditor)], { type: "text/plain" }),
+      })]);
     } else {
-      await navigator.clipboard.writeText(plainContent);
-      showToast("Copied to clipboard");
+      await writeClipboardText(docText(docEditor));
     }
+    showToast(t("Copied"));
   } catch (err) {
     console.error(err);
-    showToast("Failed to copy");
+    showToast(t("CopyFailed"));
   }
 }
 
-function domNodeToMarkdown(node) {
-  if (node.nodeType === Node.TEXT_NODE) {
-    return node.textContent;
-  }
-  if (node.nodeType !== Node.ELEMENT_NODE) {
+function toMarkdown(node) {
+  if (node.nodeType === Node.TEXT_NODE) return node.nodeValue;
+  if (node.nodeType !== Node.ELEMENT_NODE) return "";
+
+  const children = () => Array.from(node.childNodes).map(toMarkdown).join("");
+  const inline = (marker) => {
+    const inner = children().trim();
+    return inner ? marker + inner + marker : "";
+  };
+  const tag = node.tagName;
+
+  if (tag === "FIGURE") {
+    const img = node.querySelector("img");
+    const link = node.querySelector("figcaption a");
+    const caption = node.querySelector("figcaption");
+    const name = caption ? caption.textContent.split(" · ")[0] : "";
+    if (img) return "\n\n![" + (img.getAttribute("alt") || name) + "](" + img.getAttribute("src") + ")\n\n";
+    if (link) return "\n\n[" + name + "](" + link.getAttribute("href") + ")\n\n";
     return "";
   }
 
-  const el = node;
-  if (el.classList.contains("inline-remove")) return "";
-
-  if (el.classList.contains("inline-pdf")) {
-    const url = toAbsoluteUrl(el.dataset.url || "");
-    const titleSpan = el.querySelector(".inline-pdf-toolbar span");
-    const label = titleSpan ? titleSpan.textContent.trim() : "PDF";
-    return `\n\n[${label}](${url})\n\n`;
-  }
-
-  if (el.classList.contains("inline-image")) {
-    const img = el.querySelector("img");
-    if (img) {
-      const url = toAbsoluteUrl(img.getAttribute("src") || "");
-      const alt = img.getAttribute("alt") || "image";
-      return `\n\n![${alt}](${url})\n\n`;
-    }
-  }
-
-  const tag = el.tagName.toUpperCase();
-  const childrenMd = () =>
-    Array.from(el.childNodes).map(domNodeToMarkdown).join("");
-
   switch (tag) {
-    case "H1":
-      return `\n\n# ${childrenMd().trim()}\n\n`;
-    case "H2":
-      return `\n\n## ${childrenMd().trim()}\n\n`;
-    case "H3":
-      return `\n\n### ${childrenMd().trim()}\n\n`;
-    case "H4":
-      return `\n\n#### ${childrenMd().trim()}\n\n`;
-    case "H5":
-      return `\n\n##### ${childrenMd().trim()}\n\n`;
-    case "H6":
-      return `\n\n###### ${childrenMd().trim()}\n\n`;
+    case "H1": case "H2": case "H3": case "H4": case "H5": case "H6":
+      return "\n\n" + "#".repeat(Number(tag[1])) + " " + children().trim() + "\n\n";
     case "P":
+      return "\n\n" + children().trim() + "\n\n";
     case "DIV":
-      return `\n\n${childrenMd().trim()}\n\n`;
+      return "\n" + children() + "\n";
     case "BR":
       return "\n";
     case "HR":
       return "\n\n---\n\n";
     case "STRONG":
-    case "B": {
-      const inner = childrenMd();
-      return inner.trim() ? `**${inner.trim()}**` : "";
-    }
+      return inline("**");
     case "EM":
-    case "I": {
-      const inner = childrenMd();
-      return inner.trim() ? `*${inner.trim()}*` : "";
-    }
+      return inline("*");
     case "S":
     case "DEL":
-    case "STRIKE": {
-      const inner = childrenMd();
-      return inner.trim() ? `~~${inner.trim()}~~` : "";
-    }
+      return inline("~~");
     case "CODE":
-      if (el.parentElement && el.parentElement.tagName.toUpperCase() === "PRE") {
-        return el.textContent;
-      }
-      return `\`${el.textContent}\``;
+      return node.parentElement && node.parentElement.tagName === "PRE"
+        ? node.textContent
+        : "`" + node.textContent + "`";
     case "PRE":
-      return `\n\n\`\`\`\n${el.textContent.trim()}\n\`\`\`\n\n`;
-    case "BLOCKQUOTE": {
-      const lines = childrenMd()
-        .trim()
-        .split("\n")
-        .map((l) => `> ${l}`)
-        .join("\n");
-      return `\n\n${lines}\n\n`;
-    }
-    case "UL": {
-      const items = Array.from(el.children)
-        .filter((c) => c.tagName.toUpperCase() === "LI")
-        .map((li) => `- ${domNodeToMarkdown(li).trim()}`)
-        .join("\n");
-      return `\n\n${items}\n\n`;
-    }
+      return "\n\n```\n" + node.textContent.replace(/\n$/, "") + "\n```\n\n";
+    case "BLOCKQUOTE":
+      return "\n\n" + children().trim().split("\n").map((line) => "> " + line).join("\n") + "\n\n";
+    case "UL":
     case "OL": {
-      const items = Array.from(el.children)
-        .filter((c) => c.tagName.toUpperCase() === "LI")
-        .map((li, i) => `${i + 1}. ${domNodeToMarkdown(li).trim()}`)
-        .join("\n");
-      return `\n\n${items}\n\n`;
+      const items = Array.from(node.children)
+        .filter((child) => child.tagName === "LI")
+        .map((li, i) => (tag === "OL" ? i + 1 + ". " : "- ") + toMarkdown(li).trim());
+      return "\n\n" + items.join("\n") + "\n\n";
     }
-    case "LI":
-      return childrenMd();
-    case "A": {
-      const href = toAbsoluteUrl(el.getAttribute("href") || "");
-      return `[${childrenMd().trim() || href}](${href})`;
-    }
-    case "IMG": {
-      const src = toAbsoluteUrl(el.getAttribute("src") || "");
-      const alt = el.getAttribute("alt") || "image";
-      return `![${alt}](${src})`;
-    }
+    case "A":
+      return "[" + (children().trim() || node.getAttribute("href")) + "](" + node.getAttribute("href") + ")";
+    case "IMG":
+      return "![" + (node.getAttribute("alt") || "") + "](" + node.getAttribute("src") + ")";
     case "TABLE": {
-      const rows = Array.from(el.querySelectorAll("tr"));
+      const rows = Array.from(node.querySelectorAll("tr")).map((tr) =>
+        Array.from(tr.children).map((cell) => toMarkdown(cell).replace(/\s*\n\s*/g, " ").trim()));
       if (rows.length === 0) return "";
-      const matrix = rows.map((tr) =>
-        Array.from(tr.querySelectorAll("th, td")).map((cell) =>
-          domNodeToMarkdown(cell).replace(/\n+/g, " ").trim()
-        )
-      );
-      const colCount = Math.max(...matrix.map((r) => r.length), 1);
-      const fmtRow = (r) => {
-        const padded = Array.from({ length: colCount }, (_, i) => r[i] || "");
-        return `| ${padded.join(" | ")} |`;
-      };
-      const header = fmtRow(matrix[0]);
-      const sep = `| ${Array.from({ length: colCount }, () => "---").join(" | ")} |`;
-      const body = matrix.slice(1).map(fmtRow).join("\n");
-      return `\n\n${header}\n${sep}${body ? "\n" + body : ""}\n\n`;
+      const width = Math.max(...rows.map((row) => row.length), 1);
+      const line = (row) => "| " + Array.from({ length: width }, (_, i) => row[i] || "").join(" | ") + " |";
+      const separator = "| " + Array(width).fill("---").join(" | ") + " |";
+      return "\n\n" + [line(rows[0]), separator, ...rows.slice(1).map(line)].join("\n") + "\n\n";
     }
     default:
-      return childrenMd();
+      return children();
   }
 }
 
-async function copyAsMarkdown() {
+async function copyMarkdown() {
+  let markdown;
+  if (state.mode === "doc") {
+    markdown = toMarkdown(docForExport()).replace(/\n{3,}/g, "\n\n").trim();
+  } else {
+    const lang = effectiveLang();
+    markdown = lang === "md" || lang === "txt"
+      ? textarea.value
+      : "```" + lang + "\n" + textarea.value.replace(/\n$/, "") + "\n```";
+  }
   try {
-    let md = "";
-    if (editorMode === "code" || (editorMode === "preview" && previousEditMode === "code")) {
-      const code = codeTextarea.value;
-      const lang =
-        currentLangSetting !== "auto" ? currentLangSetting : detectedLang;
-      if (lang === "md" || lang === "markdown" || lang === "txt") {
-        md = code;
-      } else {
-        md = "```" + lang + "\n" + code + "\n```";
-      }
-    } else if (!hasRichHtmlElements(visualEditor)) {
-      md = extractPlainTextFromVisual();
-    } else {
-      md = domNodeToMarkdown(visualEditor)
-        .replace(/\n{3,}/g, "\n\n")
-        .trim();
-    }
-    await navigator.clipboard.writeText(md);
-    showToast("Copied as Markdown");
+    await writeClipboardText(markdown);
+    showToast(t("CopiedMd"));
   } catch (err) {
     console.error(err);
-    showToast("Failed to copy Markdown");
+    showToast(t("CopyFailed"));
   }
 }
 
-if (btnCopy) btnCopy.addEventListener("click", copyRichOrCode);
-if (btnCopyMd) btnCopyMd.addEventListener("click", copyAsMarkdown);
-if (langPill) langPill.addEventListener("click", togglePreviewMode);
+$("btn-copy").addEventListener("click", copyContent);
+$("btn-copy-md").addEventListener("click", copyMarkdown);
 
-// ============================================================================
-// Code Textarea Indentation & Input Listeners
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Editing
+// ---------------------------------------------------------------------------
 
-const INDENT = "  ";
+const INDENT = "    ";
 
 function insertIndent() {
+  // Prefer `execCommand` so the edit stays in the native undo history.
   if (!document.execCommand("insertText", false, INDENT)) {
-    codeTextarea.setRangeText(
-      INDENT,
-      codeTextarea.selectionStart,
-      codeTextarea.selectionEnd,
-      "end"
-    );
+    textarea.setRangeText(INDENT, textarea.selectionStart, textarea.selectionEnd, "end");
   }
 }
 
 function removeIndent() {
-  const lineStart =
-    codeTextarea.value.lastIndexOf("\n", codeTextarea.selectionStart - 1) + 1;
-  const indent = codeTextarea.value
-    .slice(lineStart, lineStart + INDENT.length)
-    .match(/^ +/);
-  if (!indent) return;
+  const lineStart = textarea.value.lastIndexOf("\n", textarea.selectionStart - 1) + 1;
+  const indent = textarea.value.slice(lineStart, lineStart + INDENT.length).match(/^ +/);
+
+  if (!indent) {
+    return;
+  }
 
   const width = indent[0].length;
-  const start = codeTextarea.selectionStart;
-  const end = codeTextarea.selectionEnd;
+  const start = textarea.selectionStart;
+  const end = textarea.selectionEnd;
 
-  codeTextarea.setSelectionRange(lineStart, lineStart + width);
+  textarea.setSelectionRange(lineStart, lineStart + width);
+
   if (!document.execCommand("delete")) {
-    codeTextarea.setRangeText("", lineStart, lineStart + width, "end");
-  }
-  codeTextarea.setSelectionRange(
-    Math.max(lineStart, start - width),
-    Math.max(lineStart, end - width)
-  );
-}
-
-if (codeTextarea) {
-  codeTextarea.addEventListener("scroll", syncCodeScroll);
-
-  codeTextarea.addEventListener("input", () => {
-    if (isApplyingRemote) return;
-    editRevision++;
-    lastServerRenderedMd = "";
-    evaluateSmartModeOnInput();
-    scheduleSave();
-  });
-
-  codeTextarea.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
-      e.preventDefault();
-      saveNow();
-      return;
-    }
-
-    if (e.key === "Tab" && !e.ctrlKey && !e.metaKey && !e.altKey) {
-      e.preventDefault();
-      if (e.shiftKey) {
-        removeIndent();
-      } else {
-        insertIndent();
-      }
-      editRevision++;
-      evaluateSmartModeOnInput();
-      scheduleSave();
-    }
-  });
-}
-
-if (visualEditor) {
-  visualEditor.addEventListener("input", () => {
-    if (isApplyingRemote) return;
-    editRevision++;
-    lastServerRenderedMd = "";
-    evaluateSmartModeOnInput();
-    scheduleSave();
-  });
-
-  visualEditor.addEventListener("keydown", (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
-      e.preventDefault();
-      saveNow();
-    }
-  });
-}
-
-// ============================================================================
-// Real-Time Auto-Save, Recent Switcher & SSE Live Sync
-// ============================================================================
-
-function updatePadActionLinks() {
-  if (btnDownload) {
-    btnDownload.href = currentPadId ? "/dl/" + currentPadId : "#";
-  }
-  if (btnRaw) {
-    btnRaw.href = currentPadId ? "/raw/" + currentPadId : "#";
-  }
-}
-
-function updateRecentDropdown(recentList) {
-  if (!recentSelect || !Array.isArray(recentList)) return;
-
-  const opts = [];
-  if (!currentPadId) {
-    opts.push({ value: "", label: "✦ New Blank Pad" });
+    textarea.setRangeText("", lineStart, lineStart + width, "end");
   }
 
-  for (const item of recentList) {
-    if (!item || !item.id) continue;
-    const preview = (item.preview || "Untitled pad")
-      .replace(/<[^>]+>/g, " ")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 38);
-    const extBadge = item.extension ? ` · .${item.extension}` : "";
-    opts.push({
-      value: item.id,
-      label: `${preview || item.id}${extBadge} (${item.id})`,
-    });
-  }
-
-  if (opts.length === 0) {
-    opts.push({ value: "", label: "No active pads" });
-  }
-
-  recentSelect.innerHTML = opts
-    .map(
-      (o) =>
-        `<option value="${escapeAttr(o.value)}"${
-          o.value === (currentPadId || "") ? " selected" : ""
-        }>${escapeHtml(o.label)}</option>`
-    )
-    .join("");
+  textarea.setSelectionRange(Math.max(lineStart, start - width), Math.max(lineStart, end - width));
 }
 
-function scheduleSave(immediate) {
-  clearTimeout(saveTimer);
-  if (immediate) {
-    saveNow();
-    return;
-  }
-  setSyncStatus("saving", "Saving…");
-  saveTimer = setTimeout(() => {
-    saveNow();
-  }, 200);
-}
-
-async function saveNow() {
-  clearTimeout(saveTimer);
-  if (isApplyingRemote) return;
-
-  if (currentPadId === null && isEditorEmpty()) {
-    setSyncStatus("ready", "Ready");
-    return;
-  }
-
-  if (isSaving) {
-    pendingSaveAfterCurrent = true;
-    return;
-  }
-
-  const content = getSerializedPadContent();
-  const extToSend =
-    currentLangSetting !== "auto"
-      ? currentLangSetting
-      : hasRichHtmlElements(visualEditor)
-      ? "html"
-      : detectedLang;
-
-  const signature = `${currentPadId || "new"}:${extToSend}:${currentExpiresSecs}:${content}`;
-  if (currentPadId !== null && signature === lastSavedSignature) {
-    setSyncStatus("ready", "Synced");
-    return;
-  }
-
-  const revAtStart = editRevision;
-  isSaving = true;
-  setSyncStatus("saving", "Saving…");
-
-  try {
-    const isCreate = currentPadId === null;
-    const url = isCreate ? "/api/pad" : `/api/pad/${encodeURIComponent(currentPadId)}`;
-    const method = isCreate ? "POST" : "PUT";
-
-    const resp = await fetch(url, {
-      method,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        content,
-        extension: extToSend,
-        expires: currentExpiresSecs,
-        client_id: clientId,
-      }),
-    });
-
-    if (!resp.ok) {
-      throw new Error("Save failed: " + resp.status);
-    }
-
-    const res = await resp.json();
-    if (res.id) {
-      const wasNull = currentPadId === null;
-      currentPadId = res.id;
-      updatePadActionLinks();
-      if (wasNull && window.location.pathname === "/new") {
-        history.replaceState(null, "", "/");
-      }
-    }
-
-    lastSavedSignature = `${currentPadId}:${extToSend}:${currentExpiresSecs}:${content}`;
-
-    const returnedExt = (res.extension || res.detected_lang || "").toLowerCase();
-    if (returnedExt && currentLangSetting === "auto" && !hasRichHtmlElements(visualEditor)) {
-      detectedLang = returnedExt;
-    }
-    if (res.rendered_md) {
-      lastServerRenderedMd = res.rendered_md;
-    }
-    if (res.highlighted_html && editorMode === "code" && editRevision === revAtStart) {
-      updateCodeHighlightLayer(res.highlighted_html);
-    }
-    if (res.recent) {
-      updateRecentDropdown(res.recent);
-    }
-
-    updateLangPillUI();
-    setSyncStatus("ready", "Synced");
-  } catch (err) {
-    console.error(err);
-    setSyncStatus("offline", "Offline");
-  } finally {
-    isSaving = false;
-    if (pendingSaveAfterCurrent) {
-      pendingSaveAfterCurrent = false;
-      saveNow();
-    }
-  }
-}
-
-function applyPadDataToEditor(data, preserveScroll) {
-  if (!data) return;
-  isApplyingRemote = true;
-  try {
-    const prevVisualScroll = visualEditor ? visualEditor.scrollTop : 0;
-    const prevCodeScroll = codeTextarea ? codeTextarea.scrollTop : 0;
-
-    currentPadId = data.id || null;
-    updatePadActionLinks();
-
-    const content = data.content || "";
-    lastServerRenderedMd = data.rendered_md || "";
-
-    if (data.is_image && data.raw_url) {
-      visualEditor.innerHTML = buildInlineImageMarkup({
-        url: data.raw_url,
-        dl_url: "/dl/" + data.id,
-        filename: data.title || data.id,
-        size_formatted: data.size_formatted || "",
-      });
-      switchToVisualMode(false);
-    } else if (data.is_pdf && data.raw_url) {
-      visualEditor.innerHTML = buildInlinePdfMarkup({
-        url: data.raw_url,
-        dl_url: "/dl/" + data.id,
-        filename: data.title || data.id + ".pdf",
-        size_formatted: data.size_formatted || "",
-      });
-      switchToVisualMode(false);
-    } else if (
-      /<(?:figure|div\s+class="inline-asset|table|img\s|h[1-6]\b|ul\b|ol\b|blockquote\b|p>)/i.test(
-        content
-      ) &&
-      !/^<!DOCTYPE\s+html/i.test(content.trim()) &&
-      !/^<html[\s>]/i.test(content.trim())
-    ) {
-      visualEditor.innerHTML = content;
-      detectedLang = "rich";
-      switchToVisualMode(false);
-    } else {
-      const srvLang = (data.extension || data.detected_lang || "").toLowerCase();
-      const guessed =
-        srvLang && srvLang !== "txt" && srvLang !== "auto" ? srvLang : detectLanguageClient(content);
-      detectedLang = guessed;
-
-      if (CODE_LANGS.has(guessed)) {
-        switchToCodeMode(guessed, content);
-        if (data.highlighted_html) {
-          updateCodeHighlightLayer(data.highlighted_html);
-        }
-      } else {
-        setVisualPlainText(content);
-        switchToVisualMode(false);
-      }
-    }
-
-    if (preserveScroll) {
-      if (editorMode === "code" && codeTextarea) {
-        codeTextarea.scrollTop = prevCodeScroll;
-        syncCodeScroll();
-      } else if (visualEditor) {
-        visualEditor.scrollTop = prevVisualScroll;
-      }
-    }
-
-    if (data.recent) {
-      updateRecentDropdown(data.recent);
-    }
-
-    updateLangPillUI();
-  } finally {
-    isApplyingRemote = false;
-  }
-}
-
-function resetToBlankPad(pushUrl) {
-  clearTimeout(saveTimer);
-  isApplyingRemote = true;
-  try {
-    currentPadId = null;
-    currentLangSetting = "auto";
-    detectedLang = "txt";
-    lastSavedSignature = "";
-    lastServerRenderedMd = "";
-    if (settingLang) settingLang.value = "auto";
-
-    if (visualEditor) visualEditor.innerHTML = "";
-    if (codeTextarea) codeTextarea.value = "";
-    if (codeHighlightLayer) codeHighlightLayer.innerHTML = "";
-    if (markdownPreview) markdownPreview.innerHTML = "";
-
-    updatePadActionLinks();
-    switchToVisualMode(false);
-    setSyncStatus("ready", "Ready");
-
-    if (pushUrl) {
-      history.pushState(null, "", pushUrl);
-    }
-    if (visualEditor) visualEditor.focus();
-  } finally {
-    isApplyingRemote = false;
-  }
-}
-
-async function fetchAndLoadPad(id, pushStateUrl) {
-  try {
-    setSyncStatus("saving", "Loading…");
-    const resp = await fetch(`/api/pad/${encodeURIComponent(id)}`);
-    if (!resp.ok) {
-      resetToBlankPad("/new");
-      return;
-    }
-    const data = await resp.json();
-    applyPadDataToEditor(data, false);
-    if (pushStateUrl) {
-      history.pushState(null, "", pushStateUrl);
-    }
-    setSyncStatus("ready", "Synced");
-  } catch (err) {
-    console.error(err);
-    setSyncStatus("offline", "Offline");
-  }
-}
-
-async function fetchLatestPad(onlyPopulateRecent) {
-  try {
-    const resp = await fetch("/api/pad/latest");
-    if (!resp.ok) return;
-    const data = await resp.json();
-    if (data.recent) {
-      updateRecentDropdown(data.recent);
-    }
-    if (!onlyPopulateRecent && data.id) {
-      applyPadDataToEditor(data, false);
-      setSyncStatus("ready", "Synced");
-    } else if (!onlyPopulateRecent) {
-      resetToBlankPad(null);
-    }
-  } catch (err) {
-    console.error(err);
-  }
-}
-
-// Header & Settings Controls
-if (btnNew) {
-  btnNew.addEventListener("click", () => {
-    resetToBlankPad("/new");
-  });
-}
-
-if (btnHome) {
-  btnHome.addEventListener("click", async (e) => {
-    e.preventDefault();
-    history.pushState(null, "", "/");
-    await fetchLatestPad(false);
-  });
-}
-
-if (recentSelect) {
-  recentSelect.addEventListener("change", async () => {
-    const targetId = recentSelect.value;
-    if (!targetId) {
-      resetToBlankPad("/new");
-      return;
-    }
-    await fetchAndLoadPad(targetId, "/?pad=" + encodeURIComponent(targetId));
-  });
-}
-
-if (btnSettings && settingsPopover) {
-  btnSettings.addEventListener("click", (e) => {
-    e.stopPropagation();
-    const isHidden = settingsPopover.classList.toggle("hidden");
-    btnSettings.setAttribute("aria-expanded", String(!isHidden));
-  });
-
-  document.addEventListener("click", (e) => {
-    if (
-      !settingsPopover.classList.contains("hidden") &&
-      !settingsPopover.contains(e.target) &&
-      e.target !== btnSettings
-    ) {
-      settingsPopover.classList.add("hidden");
-      btnSettings.setAttribute("aria-expanded", "false");
-    }
-  });
-
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !settingsPopover.classList.contains("hidden")) {
-      settingsPopover.classList.add("hidden");
-      btnSettings.setAttribute("aria-expanded", "false");
-    }
-  });
-}
-
-if (settingLang) {
-  settingLang.addEventListener("change", () => {
-    currentLangSetting = settingLang.value;
-    if (currentLangSetting === "rich") {
-      switchToVisualMode(false);
-    } else if (currentLangSetting !== "auto" && !hasRichHtmlElements(visualEditor)) {
-      if (CODE_LANGS.has(currentLangSetting) || currentLangSetting === "md") {
-        switchToCodeMode(currentLangSetting);
-      } else {
-        switchToVisualMode(false);
-      }
-    } else {
-      evaluateSmartModeOnInput();
-    }
-    updateLangPillUI();
-    if (currentPadId || !isEditorEmpty()) {
-      saveNow();
-    }
-  });
-}
-
-if (btnDownload) {
-  btnDownload.addEventListener("click", (e) => {
-    if (!currentPadId) {
-      e.preventDefault();
-      showToast("Nothing to download yet");
-    }
-  });
-}
-
-if (btnRaw) {
-  btnRaw.addEventListener("click", (e) => {
-    if (!currentPadId) {
-      e.preventDefault();
-      showToast("Nothing to open yet");
-    }
-  });
-}
-
-if (btnDelete) {
-  btnDelete.addEventListener("click", async () => {
-    if (!currentPadId) {
-      resetToBlankPad("/new");
-      if (settingsPopover) settingsPopover.classList.add("hidden");
-      return;
-    }
-    try {
-      const idToDelete = currentPadId;
-      const resp = await fetch(`/api/pad/${encodeURIComponent(idToDelete)}`, {
-        method: "DELETE",
-      });
-      if (resp.ok) {
-        showToast("Pad deleted");
-        if (settingsPopover) settingsPopover.classList.add("hidden");
-        currentPadId = null;
-        history.pushState(null, "", "/");
-        await fetchLatestPad(false);
-      } else {
-        showToast("Could not delete pad");
-      }
-    } catch (err) {
-      console.error(err);
-      showToast("Error deleting pad");
-    }
-  });
-}
-
-// ============================================================================
-// Live SSE Listener (GET /api/pad/events)
-// ============================================================================
-
-function initLiveSSE() {
-  if (!window.EventSource) return;
-  try {
-    const es = new EventSource("/api/pad/events");
-
-    es.addEventListener("pad_update", (e) => {
-      try {
-        const msg = JSON.parse(e.data);
-        if (!msg || msg.client_id === clientId) {
-          return;
-        }
-        if (msg.recent) {
-          updateRecentDropdown(msg.recent);
-        }
-        if (
-          msg.type === "update" &&
-          (msg.id === currentPadId ||
-            (currentPadId === null && window.location.pathname === "/"))
-        ) {
-          applyPadDataToEditor(msg, true);
-          setSyncStatus("live", "Live synced");
-        } else if ((msg.type === "delete" || msg.type === "deleted") && msg.id === currentPadId) {
-          resetToBlankPad("/new");
-          showToast("Current pad was deleted remotely");
-        }
-      } catch (err) {
-        console.error(err);
-      }
-    });
-
-    es.onerror = () => {
-      // EventSource automatically reconnects
-    };
-  } catch (err) {
-    console.error(err);
-  }
-}
-
-// ============================================================================
-// Initial Load & Popstate
-// ============================================================================
-
-async function routeCurrentLocation() {
-  const pathname = window.location.pathname;
-  const padParam = new URLSearchParams(window.location.search).get("pad");
-  if (padParam) {
-    await fetchAndLoadPad(padParam, null);
-  } else if (pathname === "/new") {
-    resetToBlankPad(null);
-    await fetchLatestPad(true);
-  } else if (pathname === "/") {
-    await fetchLatestPad(false);
-  } else {
-    const rawSeg = pathname.slice(1);
-    const id = rawSeg.split(".")[0];
-    if (id) {
-      await fetchAndLoadPad(id, null);
-    } else {
-      await fetchLatestPad(false);
-    }
-  }
-}
-
-async function initWorkspace() {
-  initExpirationUI();
-  updatePadActionLinks();
-  updateLangPillUI();
-  initLiveSSE();
-  await routeCurrentLocation();
-}
-
-window.addEventListener("popstate", () => {
-  routeCurrentLocation();
+textarea.addEventListener("input", () => {
+  renderCode();
+  onLocalEdit();
 });
 
-initWorkspace();
+textarea.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+    e.preventDefault();
+    saveNow();
+    return;
+  }
+
+  if (e.key === "Tab" && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    if (e.shiftKey) {
+      removeIndent();
+    } else {
+      insertIndent();
+    }
+    renderCode();
+    onLocalEdit();
+  }
+});
+
+docEditor.addEventListener("input", () => onLocalEdit());
+
+docEditor.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === "s") {
+    e.preventDefault();
+    saveNow();
+  }
+});
+
+if (window.ResizeObserver) {
+  new ResizeObserver(updateLineNumbers).observe(textarea);
+}
+if (document.fonts && document.fonts.ready) {
+  document.fonts.ready.then(updateLineNumbers);
+}
+
+// ---------------------------------------------------------------------------
+// Panel
+// ---------------------------------------------------------------------------
+
+titleInput.addEventListener("input", () => {
+  if (state.padId) state.titleDirty = true;
+  scheduleSave();
+});
+
+function filterLangs() {
+  const term = langFilter.value.toLowerCase();
+  for (const option of langSelect.options) {
+    const name = option.text.toLowerCase();
+    const ext = option.value.toLowerCase();
+    option.hidden = !(name.includes(term) || ext.includes(term));
+  }
+}
+
+langFilter.addEventListener("input", filterLangs);
+
+langSelect.addEventListener("change", () => {
+  const value = langSelect.value;
+  if (value === "rich") {
+    switchToDoc();
+  } else if (state.mode === "doc" && !switchToCode()) {
+    selectLang("rich");
+    return;
+  }
+  state.lang = value;
+  state.previewing = false;
+  updateAutoLabel();
+  updateView();
+  if (state.mode === "code") renderCode();
+  onLocalEdit(true);
+});
+
+for (const radio of document.querySelectorAll('#expiry-list input[name="expires"]')) {
+  radio.addEventListener("change", () => {
+    // Without a pad this only picks the expiration of the next one.
+    if (!state.padId) return;
+    state.expiryDirty = true;
+    scheduleSave(true);
+  });
+}
+
+padList.addEventListener("click", (e) => {
+  const item = e.target.closest(".pad-item");
+  if (item && item.dataset.id !== state.padId) openPad(item.dataset.id, true);
+});
+
+for (const link of [btnDownload, btnRaw]) {
+  link.addEventListener("click", (e) => {
+    if (!state.padId) e.preventDefault();
+  });
+}
+
+btnDelete.addEventListener("click", async () => {
+  if (!state.padId || !window.confirm(t("ConfirmDelete"))) return;
+  const id = state.padId;
+  try {
+    const resp = await fetch("/api/pad/" + encodeURIComponent(id), { method: "DELETE" });
+    if (!resp.ok && resp.status !== 404) throw new Error("delete failed: " + resp.status);
+    if (state.padId === id) newPad();
+    refreshPads();
+  } catch (err) {
+    console.error(err);
+    setStatus(t("Offline"));
+  }
+});
+
+$("btn-new").addEventListener("click", async () => {
+  await flushSave();
+  newPad();
+});
+
+$("btn-home").addEventListener("click", (e) => {
+  e.preventDefault();
+  history.pushState(null, "", "/");
+  openLatest();
+});
+
+btnPreview.addEventListener("click", togglePreview);
+
+window.addEventListener("popstate", route);
+
+// ---------------------------------------------------------------------------
+// Start
+// ---------------------------------------------------------------------------
+
+setMode("code");
+connectEvents();
+refreshPads();
+route();

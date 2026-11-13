@@ -18,9 +18,7 @@
       <iframe src="/raw/{{ key }}" title="{% if let Some(title) = title %}{{ title }}{% else %}{{ key }}{% endif %}"></iframe>
     </div>
   {% else if is_document %}
-    <article class="document-body">
-      {{ html|safe }}
-    </article>
+    <article class="document-body">{{ html|safe }}</article>
   {% else %}
     <div class="source-view">
       {{ html|safe }}
