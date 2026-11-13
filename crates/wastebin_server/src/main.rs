@@ -5,7 +5,9 @@ mod env;
 mod errors;
 mod handlers;
 mod i18n;
+mod mcp;
 pub(crate) mod media;
+mod pads;
 mod page;
 #[cfg(test)]
 mod test_helpers;
@@ -52,13 +54,8 @@ pub(crate) struct AppState {
     key: Key,
     page: Page,
     highlighter: Highlighter,
+    /// Pad change events. Only [`pads::Pads`] sends them.
     pad_tx: tokio::sync::broadcast::Sender<String>,
-}
-
-impl FromRef<AppState> for tokio::sync::broadcast::Sender<String> {
-    fn from_ref(state: &AppState) -> Self {
-        state.pad_tx.clone()
-    }
 }
 
 impl FromRef<AppState> for Key {
@@ -223,6 +220,13 @@ fn make_app(state: AppState, timeout: Duration, max_body_size: usize) -> Router 
         .layer(from_fn(security_headers_layer))
         .with_state(state.clone());
 
+    // Long-lived like the event stream, so outside the timeout and compression layers too.
+    let mcp_router = if state.page.mcp {
+        mcp::router(state.clone())
+    } else {
+        Router::new()
+    };
+
     app.route("/", get(html::index::get).post(insert::api::post))
         .route("/robots.txt", get(robots::get))
         .route("/theme", get(theme::get))
@@ -270,6 +274,7 @@ fn make_app(state: AppState, timeout: Duration, max_body_size: usize) -> Router 
         )
         .with_state(state)
         .merge(sse_router)
+        .merge(mcp_router)
 }
 
 async fn start() -> Result<(), Box<dyn std::error::Error>> {
@@ -285,6 +290,7 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
     let expirations = env::expiration_set()?;
     let theme = env::theme()?;
     let title = env::title();
+    let mcp = env::mcp_enabled();
 
     let cache = Cache::new(cache_size)?;
     let (db, db_handler) = Database::new(method)?;
@@ -300,6 +306,7 @@ async fn start() -> Result<(), Box<dyn std::error::Error>> {
         theme,
         expirations,
         max_body_size,
+        mcp,
     ));
     let highlighter = Arc::new(wastebin_highlight::Highlighter::default());
     let (pad_tx, _) = tokio::sync::broadcast::channel(128);

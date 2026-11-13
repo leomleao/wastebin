@@ -1,8 +1,5 @@
-use std::collections::HashMap;
 use std::convert::Infallible;
-use std::num::NonZeroU32;
-use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::Json;
 use axum::body::Bytes;
@@ -12,84 +9,13 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::stream::Stream;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast::{self, error::RecvError};
+use tokio::sync::broadcast::error::RecvError;
 
-use crate::cache::{Cache, valid_extension};
-use crate::detect::{detect_language, highlight_code};
-use crate::errors::{Error, JsonError, JsonErrorResponse};
-use crate::{Highlighter, Page};
-use wastebin_core::db::read::{Data, Metadata, PadSummary};
-use wastebin_core::db::{self, Database, write};
-use wastebin_core::id::Id;
+use crate::errors::{JsonError, JsonErrorResponse};
+use crate::pads::{PadError, Pads};
+use wastebin_core::db::read::PadSummary;
 
-/// Number of pads listed by `/api/pads`.
-const RECENT_PADS: usize = 20;
-
-/// Uploads that belong to no pad expire after a day. Uploads into a pad are deleted with it.
-const UNOWNED_ASSET_EXPIRY: u32 = 86_400;
-
-/// How long the pad created for a `create_key` is remembered.
-const CREATE_KEY_TTL: Duration = Duration::from_secs(600);
-
-/// Longest accepted `create_key`.
-const MAX_CREATE_KEY_LEN: usize = 64;
-
-/// Pads created recently, by the `create_key` of the request that created them. An editor that
-/// lost the response to a create retries with the same key and gets the same pad back instead of
-/// a second one. Memory is enough: losing a response right when the server restarts is rare, and
-/// costs no more than a duplicate pad.
-static CREATED: LazyLock<tokio::sync::Mutex<HashMap<String, (Id, Instant)>>> =
-    LazyLock::new(Default::default);
-
-/// Longest pad label kept for the pad list.
-const MAX_PREVIEW_CHARS: usize = 80;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PadResponse {
-    pub id: String,
-    pub extension: String,
-    /// Whether `extension` is what auto-detection picks for the content, i.e. the editor can
-    /// keep detecting the language instead of pinning `extension`. Only set when loading.
-    #[serde(default)]
-    pub auto_detected: bool,
-    pub title: Option<String>,
-    /// Seconds until the pad expires, `None` if it never does.
-    pub expires_in: Option<u64>,
-    /// Revision of the pad. Later revisions compare greater; send it back as `base_revision`.
-    pub revision: Option<String>,
-    /// Content, only returned when loading a pad.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
-    /// Syntax-highlighted content, only returned when loading a pad.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub highlighted_html: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct PadWriteRequest {
-    #[serde(default)]
-    pub content: String,
-    /// `auto`, `rich` for a document, or a file extension.
-    #[serde(default)]
-    pub extension: Option<String>,
-    /// Label in the pad list.
-    #[serde(default)]
-    pub preview: Option<String>,
-    /// On update, `None` keeps the current title and an empty title clears it.
-    #[serde(default)]
-    pub title: Option<String>,
-    /// Expiration in seconds, `0` for never. On update, `None` keeps the current expiration;
-    /// on creation it selects the configured default.
-    #[serde(default)]
-    pub expires: Option<u32>,
-    /// On update, the revision the content is based on. If the pad changed since, the update is
-    /// refused with `409 Conflict` and the current pad.
-    #[serde(default)]
-    pub base_revision: Option<String>,
-    /// On creation, a key the editor keeps for retries of the same create.
-    #[serde(default)]
-    pub create_key: Option<String>,
-}
+pub use crate::pads::{PadResponse, PadWriteRequest};
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct AssetQuery {
@@ -109,329 +35,108 @@ pub struct AssetUploadResponse {
     pub is_pdf: bool,
 }
 
-fn bad_request(status: StatusCode, message: &str) -> JsonErrorResponse {
+fn json_error(status: StatusCode, message: &str) -> Response {
     (
         status,
         Json(JsonError {
             message: message.to_string(),
         }),
     )
+        .into_response()
 }
 
-/// Expiration for a new pad: `0` never expires, `None` uses the configured default.
-fn new_expiration(page: &Page, expires: Option<u32>) -> Option<NonZeroU32> {
-    match expires {
-        Some(secs) => NonZeroU32::new(secs),
-        None => page
-            .expirations
-            .iter()
-            .find(|expiration| expiration.default)
-            .and_then(|expiration| u32::try_from(expiration.duration.as_secs()).ok())
-            .and_then(NonZeroU32::new),
+impl IntoResponse for PadError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Invalid(message) => json_error(StatusCode::BAD_REQUEST, message),
+            Self::UnsupportedMedia => json_error(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "only images and PDFs can be uploaded",
+            ),
+            Self::Conflict(pad) => (StatusCode::CONFLICT, Json(pad)).into_response(),
+            Self::Other(err) => JsonErrorResponse::from(err).into_response(),
+        }
     }
-}
-
-fn trimmed(text: &str, max_chars: usize) -> Option<String> {
-    let text: String = text.trim().chars().take(max_chars).collect();
-    (!text.is_empty()).then_some(text)
-}
-
-fn parse_pad_id(raw: &str) -> Result<Id, Error> {
-    let base = raw.split_once('.').map_or(raw, |(id, _)| id);
-    base.parse::<Id>().map_err(Error::Id)
-}
-
-/// Extension to store a pad under: detected for `auto`, otherwise validated.
-fn pad_extension(req: &PadWriteRequest) -> Result<String, JsonErrorResponse> {
-    let extension = detect_language(&req.content, req.extension.as_deref());
-    if valid_extension(&extension) {
-        Ok(extension)
-    } else {
-        Err(bad_request(StatusCode::BAD_REQUEST, "invalid extension"))
-    }
-}
-
-/// A saved pad, without its content.
-fn saved(id: Id, extension: String, metadata: &Metadata) -> PadResponse {
-    PadResponse {
-        id: id.to_string(),
-        extension,
-        auto_detected: false,
-        title: metadata.title.clone(),
-        expires_in: metadata
-            .expiration
-            .as_ref()
-            .map(|expiration| expiration.duration.as_secs()),
-        revision: metadata.updated_at.clone(),
-        content: None,
-        highlighted_html: None,
-    }
-}
-
-/// A pad loaded into the editor, with its content and highlighting.
-async fn loaded(highlighter: Highlighter, id: Id, data: Data) -> PadResponse {
-    let extension = data
-        .metadata
-        .extension
-        .clone()
-        .unwrap_or_else(|| "txt".to_string());
-    let highlighted_html = if extension == "rich" {
-        None
-    } else {
-        highlight_code(highlighter, data.text.clone(), extension.clone()).await
-    };
-
-    PadResponse {
-        auto_detected: detect_language(&data.text, None) == extension,
-        content: Some(data.text),
-        highlighted_html,
-        ..saved(id, extension, &data.metadata)
-    }
-}
-
-/// Tell all event stream listeners that pad `id` changed. Sending fails only when nobody listens.
-fn broadcast(pad_tx: &broadcast::Sender<String>, kind: &str, id: Id, revision: Option<&str>) {
-    let event = serde_json::json!({ "type": kind, "id": id.to_string(), "revision": revision });
-    let _ = pad_tx.send(event.to_string());
 }
 
 /// GET handler for the list of recent pads.
-pub async fn list_pads(
-    State(db): State<Database>,
-) -> Result<Json<Vec<PadSummary>>, JsonErrorResponse> {
-    Ok(Json(
-        db.list_recent_pads(RECENT_PADS)
-            .await
-            .map_err(Error::Database)?,
-    ))
+pub async fn list_pads(State(pads): State<Pads>) -> Result<Json<Vec<PadSummary>>, PadError> {
+    Ok(Json(pads.list().await?))
 }
 
 /// GET handler for the most recently modified pad, `null` if there is none.
-pub async fn get_latest(
-    State(db): State<Database>,
-    State(highlighter): State<Highlighter>,
-) -> Result<Json<Option<PadResponse>>, JsonErrorResponse> {
-    Ok(Json(
-        match db.get_latest_pad().await.map_err(Error::Database)? {
-            Some((id, data)) => Some(loaded(highlighter, id, data).await),
-            None => None,
-        },
-    ))
+pub async fn get_latest(State(pads): State<Pads>) -> Result<Json<Option<PadResponse>>, PadError> {
+    Ok(Json(pads.latest().await?))
 }
 
 /// GET handler for a pad. Entries that are not pads are reported as not found.
 pub async fn get_pad(
-    State(db): State<Database>,
-    State(highlighter): State<Highlighter>,
+    State(pads): State<Pads>,
     Path(id): Path<String>,
-) -> Result<Json<PadResponse>, JsonErrorResponse> {
-    let id = parse_pad_id(&id)?;
-    let data = db.get_pad(id).await.map_err(Error::Database)?;
-    Ok(Json(loaded(highlighter, id, data).await))
-}
-
-/// The changes a write request makes to an existing pad: the content, and the title,
-/// expiration and label when present.
-fn pad_update(req: PadWriteRequest, extension: &str) -> write::PadUpdate {
-    write::PadUpdate {
-        extension: Some(extension.to_string()),
-        preview: req
-            .preview
-            .as_deref()
-            .map(|p| trimmed(p, MAX_PREVIEW_CHARS)),
-        title: req.title.as_deref().map(|t| trimmed(t, usize::MAX)),
-        expires: req.expires.map(NonZeroU32::new),
-        base_revision: req.base_revision,
-        text: req.content,
-    }
+) -> Result<Json<PadResponse>, PadError> {
+    Ok(Json(pads.load(&id).await?))
 }
 
 /// POST handler creating a new pad. A retry with the same `create_key` updates the pad the key
 /// created instead of creating another one.
 pub async fn create_pad(
-    State(db): State<Database>,
-    State(page): State<Page>,
-    State(pad_tx): State<broadcast::Sender<String>>,
+    State(pads): State<Pads>,
     Json(req): Json<PadWriteRequest>,
-) -> Result<Json<PadResponse>, JsonErrorResponse> {
-    let extension = pad_extension(&req)?;
-    if req
-        .create_key
-        .as_ref()
-        .is_some_and(|key| key.len() > MAX_CREATE_KEY_LEN)
-    {
-        return Err(bad_request(StatusCode::BAD_REQUEST, "create_key too long"));
-    }
-
-    // Finish even when the request is dropped (timeout, disconnect), so that a pad that was
-    // inserted always has its key recorded and a retry cannot duplicate it.
-    tokio::spawn(create(db, page, pad_tx, req, extension))
-        .await
-        .map_err(Error::Join)?
-}
-
-async fn create(
-    db: Database,
-    page: Page,
-    pad_tx: broadcast::Sender<String>,
-    mut req: PadWriteRequest,
-    extension: String,
-) -> Result<Json<PadResponse>, JsonErrorResponse> {
-    // Held until the pad is recorded, so that a retry racing the original waits for it.
-    let mut created = match &req.create_key {
-        Some(_) => Some(CREATED.lock().await),
-        None => None,
-    };
-
-    if let Some(created) = created.as_mut() {
-        created.retain(|_, (_, at)| at.elapsed() < CREATE_KEY_TTL);
-        let known = req.create_key.as_ref().and_then(|key| created.get(key));
-        if let Some(&(id, _)) = known {
-            // The client did not see the first response: apply what it sends now.
-            req.base_revision = None;
-            match db.update_pad(id, pad_update(req.clone(), &extension)).await {
-                Ok(metadata) => {
-                    broadcast(&pad_tx, "update", id, metadata.updated_at.as_deref());
-                    return Ok(Json(saved(id, extension, &metadata)));
-                }
-                // Deleted since: create it anew.
-                Err(db::Error::NotFound) => {}
-                Err(err) => return Err(Error::Database(err).into()),
-            }
-        }
-    }
-
-    let entry = write::Entry {
-        extension: Some(extension.clone()),
-        expires: new_expiration(&page, req.expires),
-        title: req.title.as_deref().and_then(|t| trimmed(t, usize::MAX)),
-        preview: req
-            .preview
-            .as_deref()
-            .and_then(|p| trimmed(p, MAX_PREVIEW_CHARS)),
-        is_pad: true,
-        text: req.content,
-        ..Default::default()
-    };
-
-    let (id, _) = db.insert(entry).await.map_err(Error::Database)?;
-    if let (Some(created), Some(key)) = (created.as_mut(), req.create_key) {
-        created.insert(key, (id, Instant::now()));
-    }
-    drop(created);
-
-    let metadata = db.get_metadata(id).await.map_err(Error::Database)?;
-    broadcast(&pad_tx, "created", id, metadata.updated_at.as_deref());
-    Ok(Json(saved(id, extension, &metadata)))
+) -> Result<Json<PadResponse>, PadError> {
+    Ok(Json(pads.create(req).await?))
 }
 
 /// PUT handler replacing the content of a pad. Only the title and expiration present in the
 /// request are changed. Entries that are not pads are reported as not found and left alone. A
 /// write based on an outdated revision is answered with `409 Conflict` and the current pad.
 pub async fn update_pad(
-    State(db): State<Database>,
-    State(highlighter): State<Highlighter>,
-    State(cache): State<Cache>,
-    State(pad_tx): State<broadcast::Sender<String>>,
+    State(pads): State<Pads>,
     Path(id): Path<String>,
     Json(req): Json<PadWriteRequest>,
-) -> Result<Response, JsonErrorResponse> {
-    let id = parse_pad_id(&id)?;
-    let extension = pad_extension(&req)?;
-    let has_base = req.base_revision.is_some();
-
-    let update = pad_update(req, &extension);
-
-    let metadata = match db.update_pad(id, update).await {
-        Ok(metadata) => metadata,
-        Err(db::Error::NotFound) if has_base => {
-            // Either the pad is gone or someone else wrote first.
-            let current = db.get_pad(id).await.map_err(Error::Database)?;
-            let pad = loaded(highlighter, id, current).await;
-            return Ok((StatusCode::CONFLICT, Json(pad)).into_response());
-        }
-        Err(err) => return Err(Error::Database(err).into()),
-    };
-
-    // The paste views never cache pads, but drop anything cached for this id before it became
-    // mutable.
-    cache.remove(id);
-
-    broadcast(&pad_tx, "update", id, metadata.updated_at.as_deref());
-    Ok(Json(saved(id, extension, &metadata)).into_response())
+) -> Result<Json<PadResponse>, PadError> {
+    Ok(Json(pads.update(&id, req).await?))
 }
 
 /// DELETE handler for a pad and the uploads it owns. Entries that are not pads are reported as
 /// not found and left alone.
 pub async fn delete_pad(
-    State(db): State<Database>,
-    State(cache): State<Cache>,
-    State(pad_tx): State<broadcast::Sender<String>>,
+    State(pads): State<Pads>,
     Path(id): Path<String>,
-) -> Result<StatusCode, JsonErrorResponse> {
-    let id = parse_pad_id(&id)?;
-
-    if !db.delete_pad(id).await.map_err(Error::Database)? {
-        return Err(Error::Database(db::Error::NotFound).into());
-    }
-
-    cache.remove(id);
-    broadcast(&pad_tx, "deleted", id, None);
+) -> Result<StatusCode, PadError> {
+    pads.delete(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// POST handler storing an image or PDF pasted or dropped into the pad editor. The body is the
 /// file itself, typed by its `Content-Type`; `?pad=` names the pad it belongs to.
 pub async fn upload_asset(
-    State(db): State<Database>,
+    State(pads): State<Pads>,
     Query(query): Query<AssetQuery>,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Json<AssetUploadResponse>, JsonErrorResponse> {
+) -> Result<Json<AssetUploadResponse>, PadError> {
     let mime = headers
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    let Some(ext) = crate::media::ext_for_mime(mime) else {
-        return Err(bad_request(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "only images and PDFs can be uploaded",
-        ));
-    };
-    if body.is_empty() {
-        return Err(bad_request(StatusCode::BAD_REQUEST, "empty upload"));
-    }
-
-    let owner = match query.pad.as_deref() {
-        Some(pad) => {
-            let pad = parse_pad_id(pad)?;
-            db.get_pad(pad).await.map_err(Error::Database)?;
-            Some(pad)
-        }
-        None => None,
-    };
-    let expires = owner.map_or(NonZeroU32::new(UNOWNED_ASSET_EXPIRY), |_| None);
-
-    let title = query.filename.as_deref().and_then(|f| trimmed(f, 255));
-    let id = db
-        .insert_asset(&body, ext, title.clone(), expires, owner)
-        .await
-        .map_err(Error::Database)?;
+    let file = pads
+        .upload(query.pad.as_deref(), mime, query.filename.as_deref(), &body)
+        .await?;
 
     Ok(Json(AssetUploadResponse {
-        url: format!("/raw/{id}.{ext}"),
-        dl_url: format!("/dl/{id}.{ext}"),
-        filename: title.unwrap_or_else(|| format!("{id}.{ext}")),
-        size_formatted: crate::media::format_size(body.len()),
-        is_pdf: ext == "pdf",
+        url: format!("/raw/{}", file.path()),
+        dl_url: format!("/dl/{}", file.path()),
+        size_formatted: crate::media::format_size(file.size),
+        is_pdf: file.extension == "pdf",
+        filename: file.name,
     }))
 }
 
 /// GET handler streaming `{type, id, revision}` for every pad change as server-sent events.
 pub async fn sse_events(
-    State(pad_tx): State<broadcast::Sender<String>>,
+    State(pads): State<Pads>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = pad_tx.subscribe();
+    let rx = pads.subscribe();
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
         loop {
             match rx.recv().await {
@@ -456,8 +161,10 @@ pub async fn sse_events(
 mod tests {
     use super::*;
     use crate::handlers::insert::form::Entry;
+    use crate::pads::CREATED;
     use crate::test_helpers::{Client, StoreCookies};
     use reqwest::StatusCode;
+    use wastebin_core::id::Id;
 
     fn write(content: &str) -> PadWriteRequest {
         PadWriteRequest {

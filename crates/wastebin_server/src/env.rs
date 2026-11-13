@@ -64,6 +64,18 @@ pub fn title() -> String {
     std::env::var(vars::TITLE).unwrap_or_else(|_| "wastebin".to_string())
 }
 
+/// Whether the MCP server at `/mcp` is enabled: unless the variable is `false`, `0` or `off`.
+pub fn mcp_enabled() -> bool {
+    std::env::var(vars::MCP).map_or(true, |var| mcp_value(&var))
+}
+
+fn mcp_value(var: &str) -> bool {
+    !matches!(
+        var.trim().to_ascii_lowercase().as_str(),
+        "false" | "0" | "off"
+    )
+}
+
 pub fn theme() -> Result<Theme, Error> {
     Ok(std::env::var(vars::THEME).map_or_else(|_| Ok(Theme::Ayu), |var| var.parse())?)
 }
@@ -159,4 +171,19 @@ pub fn expiration_set() -> Result<expiration::ExpirationSet, Error> {
     )?;
 
     Ok(set)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mcp_value;
+
+    #[test]
+    fn mcp_is_disabled_only_explicitly() {
+        for off in ["false", "0", "off", "OFF", " False "] {
+            assert!(!mcp_value(off), "{off}");
+        }
+        for on in ["true", "1", "on", "", "yes"] {
+            assert!(mcp_value(on), "{on}");
+        }
+    }
 }

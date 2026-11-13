@@ -12,6 +12,8 @@ pub mod vars {
     pub const HTTP_TIMEOUT: &str = "WASTEBIN_HTTP_TIMEOUT";
     /// Maximum body size.
     pub const MAX_BODY_SIZE: &str = "WASTEBIN_MAX_BODY_SIZE";
+    /// Whether the MCP server is enabled.
+    pub const MCP: &str = "WASTEBIN_MCP";
     /// Password salt for encryption.
     pub const PASSWORD_SALT: &str = "WASTEBIN_PASSWORD_SALT";
     /// Expirations list.

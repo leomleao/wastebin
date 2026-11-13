@@ -14,6 +14,31 @@ use wastebin_core::db::{self, Database};
 use wastebin_core::expiration::ExpirationSet;
 use wastebin_highlight::{Highlighter, Theme};
 
+/// Application state with an in-memory database, whose handler runs on the current runtime.
+pub(crate) fn state() -> crate::AppState {
+    let (db, handler) = Database::new(db::Open::Memory).expect("open memory database");
+    tokio::spawn(handler);
+    let cache = Cache::new(NonZeroUsize::new(128).unwrap()).unwrap();
+    let key = Key::generate();
+    let expirations = "0".parse::<ExpirationSet>().unwrap();
+    let page = Arc::new(page::Page::new(
+        String::from("test"),
+        url::Url::parse("https://localhost:8888").unwrap(),
+        Theme::Ayu,
+        expirations,
+        1024 * 1024,
+        true,
+    ));
+    crate::AppState {
+        db,
+        cache,
+        key,
+        page,
+        highlighter: Arc::new(Highlighter::default()),
+        pad_tx: tokio::sync::broadcast::channel(128).0,
+    }
+}
+
 pub(crate) struct Client {
     client: reqwest::Client,
     addr: SocketAddr,
@@ -29,33 +54,13 @@ impl Client {
 
     /// Server whose requests time out after `timeout`.
     pub(crate) async fn with_timeout(store_cookies: StoreCookies, timeout: Duration) -> Self {
-        let (db, handler) = Database::new(db::Open::Memory).expect("open memory database");
-        let cache = Cache::new(NonZeroUsize::new(128).unwrap()).unwrap();
-        let key = Key::generate();
-        let expirations = "0".parse::<ExpirationSet>().unwrap();
-        let page = Arc::new(page::Page::new(
-            String::from("test"),
-            url::Url::parse("https://localhost:8888").unwrap(),
-            Theme::Ayu,
-            expirations,
-            1024 * 1024,
-        ));
-        let state = crate::AppState {
-            db,
-            cache,
-            key,
-            page,
-            highlighter: Arc::new(Highlighter::default()),
-            pad_tx: tokio::sync::broadcast::channel(128).0,
-        };
+        let state = state();
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("Could not bind ephemeral socket");
 
         let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(handler);
 
         tokio::spawn(async move {
             let app = crate::make_app(state, timeout, 1024 * 1024);
