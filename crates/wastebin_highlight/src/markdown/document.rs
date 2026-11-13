@@ -317,6 +317,7 @@ fn converter() -> &'static HtmlToMarkdown {
                 Some("\n\n---\n\n".into())
             })
             .add_handler(vec!["s", "del", "strike"], strikethrough_handler)
+            .add_handler(vec!["u", "sub", "sup"], inline_html_handler)
             .build()
     })
 }
@@ -413,6 +414,12 @@ fn indentation(node: &Rc<Node>) -> String {
             _ => None,
         })
         .collect()
+}
+
+/// Markdown has no underline, subscript or superscript: they stay inline HTML.
+fn inline_html_handler(handlers: &dyn Handlers, element: Element) -> Option<HandlerResult> {
+    let content = handlers.walk_children(element.node).content;
+    Some(format!("<{tag}>{content}</{tag}>", tag = element.tag).into())
 }
 
 fn strikethrough_handler(handlers: &dyn Handlers, element: Element) -> Option<HandlerResult> {
@@ -622,6 +629,14 @@ mod tests {
             format!("<p>fn main() {{<br>{four}run();<br>{four}done();<br>}}</p>")
         );
         assert_eq!(editor_html_to_markdown(&html), markdown);
+    }
+
+    #[test]
+    fn underline_subscript_and_superscript_stay_html() {
+        assert_converts(
+            "<u>under</u>, H<sub>2</sub>O and x<sup>2</sup>",
+            "<p><u>under</u>, H<sub>2</sub>O and x<sup>2</sup></p>",
+        );
     }
 
     #[test]
