@@ -360,6 +360,7 @@ impl Pads {
             let current = self.db.get_pad(id).await?;
             let extension = current.metadata.extension.as_deref().unwrap_or("txt");
             let (text, extension) = change(&current.text, extension);
+            self.check_size(&text)?;
             let update = write::PadUpdate {
                 extension: Some(extension.clone()),
                 preview: None,
@@ -925,6 +926,47 @@ mod tests {
         for file in &files {
             assert!(content.contains(&file.path()), "{content}");
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn appends_and_uploads_stop_at_the_size_limit() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let pads = Pads::from_ref(&crate::test_helpers::state_with_limit(2048));
+        let created = pads
+            .create(write("start"))
+            .await
+            .map_err(|err| format!("{err:?}"))?;
+        let line = "a".repeat(1000);
+
+        for _ in 0..2 {
+            pads.append(&created.id, &line, &Uploads::default())
+                .await
+                .map_err(|err| format!("{err:?}"))?;
+        }
+        let full = pads.append(&created.id, &line, &Uploads::default()).await;
+        assert!(matches!(full, Err(PadError::TooLarge(2048))), "{full:?}");
+        let attached = pads
+            .attach(&created.id, "image/png", Some("a.png"), b"\x89PNG")
+            .await;
+        assert!(
+            matches!(attached, Err(PadError::TooLarge(2048))),
+            "{attached:?}"
+        );
+
+        // Unchanged, and the file is not kept.
+        let pad = pads
+            .get(&created.id)
+            .await
+            .map_err(|err| format!("{err:?}"))?;
+        assert_eq!(pad.content.map(|c| c.len()), Some(5 + 2 * 1001));
+        assert_eq!(pad.extension, "txt");
+        let files = pads
+            .files(&created.id)
+            .await
+            .map_err(|err| format!("{err:?}"))?;
+        assert!(files.is_empty());
 
         Ok(())
     }
