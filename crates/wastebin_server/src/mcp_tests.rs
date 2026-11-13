@@ -1089,10 +1089,7 @@ async fn noop_edit_leaves_an_uploaded_into_code_pad_unchanged() -> TestResult {
     let after = read_pad(&client, id).await?;
     assert_eq!(after["text"], before["text"]);
     let text = str_of(&after, "text");
-    assert!(
-        text.starts_with("fn main() {\n\u{a0}\u{a0}\u{a0}\u{a0}run();\n}"),
-        "{text}"
-    );
+    assert!(text.starts_with("fn main() {\n    run();\n}"), "{text}");
 
     // The figure keeps its size.
     let api: Value = client
@@ -1104,6 +1101,12 @@ async fn noop_edit_leaves_an_uploaded_into_code_pad_unchanged() -> TestResult {
     let html = str_of(&api, "content");
     assert!(
         html.contains(&format!("shot.png · {} B · ", PNG.len())),
+        "{html}"
+    );
+    // The indentation is stored as spaces, which the editor copies as they are.
+    assert!(html.contains("<br>    run();<br>"), "{html}");
+    assert!(
+        !html.contains("&nbsp;") && !html.contains('\u{a0}'),
         "{html}"
     );
 

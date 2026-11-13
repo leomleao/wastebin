@@ -6,7 +6,8 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::ops::Range;
+use std::rc::{Rc, Weak};
 use std::sync::OnceLock;
 
 use ammonia::{Builder, UrlRelative};
@@ -34,11 +35,9 @@ pub fn markdown_to_editor_html(markdown: &str, uploads: &Uploads) -> String {
         markdown,
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH,
     );
+    let events = indented_lines(markdown, parser.into_offset_iter().collect());
     let mut raw = String::with_capacity(markdown.len());
-    html::push_html(
-        &mut raw,
-        editor_events(parser.collect(), uploads).into_iter(),
-    );
+    html::push_html(&mut raw, editor_events(events, uploads).into_iter());
     strip_layout_newlines(&sanitizer().clean(&raw).to_string())
 }
 
@@ -114,6 +113,31 @@ impl<'a> Asset<'a> {
     }
 }
 
+/// `events` of `markdown`, with the indentation Markdown drops from the continuation lines of a
+/// top-level paragraph put back: the editor shows every line as it is.
+fn indented_lines<'a>(markdown: &'a str, events: Vec<(Event<'a>, Range<usize>)>) -> Vec<Event<'a>> {
+    let mut out = Vec::with_capacity(events.len());
+    let mut depth = 0usize;
+    for (i, (event, range)) in events.iter().enumerate() {
+        match event {
+            Event::Start(Tag::List(_) | Tag::BlockQuote(_)) => depth += 1,
+            Event::End(TagEnd::List(_) | TagEnd::BlockQuote(_)) => depth -= 1,
+            _ => {}
+        }
+        out.push(event.clone());
+        if depth == 0
+            && matches!(event, Event::SoftBreak | Event::HardBreak)
+            && let Some((_, next)) = events.get(i + 1)
+            && let Some(gap) = markdown.get(range.end..next.start)
+            && !gap.is_empty()
+            && gap.chars().all(|c| matches!(c, ' ' | '\t'))
+        {
+            out.push(Event::Text(gap.into()));
+        }
+    }
+    out
+}
+
 fn editor_events<'a>(events: Vec<Event<'a>>, uploads: &Uploads) -> Vec<Event<'a>> {
     let events: Vec<Event<'a>> = events
         .into_iter()
@@ -123,6 +147,7 @@ fn editor_events<'a>(events: Vec<Event<'a>>, uploads: &Uploads) -> Vec<Event<'a>
     let mut out = Vec::with_capacity(events.len());
     // For each open image: whether it was turned into a link.
     let mut images = Vec::new();
+    let mut line_start = false;
     let mut i = 0;
 
     while i < events.len() {
@@ -162,8 +187,19 @@ fn editor_events<'a>(events: Vec<Event<'a>>, uploads: &Uploads) -> Vec<Event<'a>
             }
             // A newline is a line break in the editor.
             Event::SoftBreak | Event::HardBreak => out.push(Event::InlineHtml("<br>".into())),
+            // Indentation read as no-break spaces is stored as spaces again, which the editor
+            // shows and copies as they are.
+            Event::Text(text) if line_start => {
+                let rest = text.trim_start_matches('\u{a0}');
+                let indent = " ".repeat(text[..text.len() - rest.len()].chars().count());
+                out.push(Event::Text(format!("{indent}{rest}").into()));
+            }
             other => out.push(other.clone()),
         }
+        line_start = matches!(
+            events[i],
+            Event::Start(Tag::Paragraph) | Event::SoftBreak | Event::HardBreak
+        );
         i += 1;
     }
 
@@ -386,7 +422,14 @@ fn converter() -> &'static HtmlToMarkdown {
             })
             .add_handler(vec!["figure"], figure_handler)
             .add_handler(vec!["div"], line_handler)
-            .add_handler(vec!["br"], |_: &dyn Handlers, _: Element| Some("\n".into()))
+            .add_handler(vec!["p"], |handlers: &dyn Handlers, element: Element| {
+                keep_indentation(element.node.children.borrow().first());
+                handlers.fallback(element)
+            })
+            .add_handler(vec!["br"], |_: &dyn Handlers, element: Element| {
+                keep_indentation(next_sibling(element.node).as_ref());
+                Some("\n".into())
+            })
             .add_handler(vec!["hr"], |_: &dyn Handlers, _: Element| {
                 Some("\n\n---\n\n".into())
             })
@@ -453,9 +496,9 @@ fn asset_markdown(element: &Element) -> Option<String> {
 }
 
 /// A `<div>` is one line of the editor; an empty one is a blank line. Only the line's leading
-/// newline is emitted: htmd adds up the newlines between siblings. Leading spaces become no-break
-/// spaces, which Markdown keeps, so that an indented line stays indented.
+/// newline is emitted: htmd adds up the newlines between siblings.
 fn line_handler(handlers: &dyn Handlers, element: Element) -> Option<HandlerResult> {
+    keep_indentation(element.node.children.borrow().first());
     let content = handlers.walk_children(element.node).content;
     let content = content.trim_matches('\n');
     let has_blocks = element.node.children.borrow().iter().any(|child| {
@@ -468,26 +511,57 @@ fn line_handler(handlers: &dyn Handlers, element: Element) -> Option<HandlerResu
     } else if has_blocks {
         format!("\n\n{content}\n\n").into()
     } else {
-        let content = content.trim_start_matches(' ');
-        format!("\n{}{content}", indentation(element.node)).into()
+        format!("\n{content}").into()
     })
 }
 
-/// The leading spaces of `node`'s text as no-break spaces, a tab as four.
-fn indentation(node: &Rc<Node>) -> String {
-    let children = node.children.borrow();
-    let Some(NodeData::Text { contents }) = children.first().map(|child| &child.data) else {
-        return String::new();
+/// Turn the leading spaces of the line starting with `node`, if it is text outside a code block,
+/// into no-break spaces (a tab into four), which htmd and Markdown keep. [`plain_indentation`]
+/// turns them back into spaces where Markdown keeps those too.
+fn keep_indentation(node: Option<&Rc<Node>>) {
+    let Some(node) = node else { return };
+    let NodeData::Text { contents } = &node.data else {
+        return;
     };
-    contents
-        .borrow()
+    if ancestors(node).any(|ancestor| {
+        matches!(&ancestor.data, NodeData::Element { name, .. } if &*name.local == "pre")
+    }) {
+        return;
+    }
+    let mut contents = contents.borrow_mut();
+    let rest = contents.trim_start_matches([' ', '\t']);
+    if rest.len() == contents.len() {
+        return;
+    }
+    let indented: String = contents
         .chars()
         .map_while(|c| match c {
             ' ' => Some("\u{a0}"),
             '\t' => Some("\u{a0}\u{a0}\u{a0}\u{a0}"),
             _ => None,
         })
-        .collect()
+        .chain([rest])
+        .collect();
+    contents.clear();
+    contents.push_slice(&indented);
+}
+
+fn parent(node: &Node) -> Option<Rc<Node>> {
+    let weak = node.parent.take();
+    let parent = weak.as_ref().and_then(Weak::upgrade);
+    node.parent.set(weak);
+    parent
+}
+
+fn ancestors(node: &Rc<Node>) -> impl Iterator<Item = Rc<Node>> {
+    std::iter::successors(parent(node), |node| parent(node))
+}
+
+fn next_sibling(node: &Rc<Node>) -> Option<Rc<Node>> {
+    let parent = parent(node)?;
+    let children = parent.children.borrow();
+    let index = children.iter().position(|child| Rc::ptr_eq(child, node))?;
+    children.get(index + 1).cloned()
 }
 
 /// Markdown has no underline, subscript or superscript: they stay inline HTML.
@@ -560,11 +634,40 @@ fn unescape_intraword_underscores(markdown: &str) -> String {
                 fence = Some(ticks);
                 out.push_str(line);
             }
-            None => unescape_line(line, &mut out),
+            None => {
+                let previous = out.strip_suffix('\n').unwrap_or(&out);
+                let continues = !previous
+                    .rsplit('\n')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty();
+                let line = if continues {
+                    plain_indentation(line)
+                } else {
+                    line.into()
+                };
+                unescape_line(&line, &mut out);
+            }
         }
     }
 
     out
+}
+
+/// `line`, continuing a paragraph, with its leading no-break spaces as spaces: Markdown keeps
+/// the line in the paragraph, and the editor gets its indentation back. Not where the spaces
+/// would let the line start a block.
+fn plain_indentation(line: &str) -> Cow<'_, str> {
+    let rest = line.trim_start_matches('\u{a0}');
+    let starts_block = rest.starts_with(|c: char| {
+        c.is_ascii_digit() || matches!(c, '-' | '+' | '*' | '>' | '#' | '=' | '|' | '`' | '~' | '<')
+    });
+    if rest.len() == line.len() || starts_block {
+        return line.into();
+    }
+    let indent = " ".repeat(line[..line.len() - rest.len()].chars().count());
+    format!("{indent}{rest}").into()
 }
 
 fn unescape_line(line: &str, out: &mut String) {
@@ -695,20 +798,39 @@ mod tests {
         // A code pad turned document by an upload: one line per `<div>`.
         let html = "<div>fn main() {</div><div>    run();</div><div>\tdone();</div><div>}</div>";
         let markdown = editor_html_to_markdown(html);
-        let four = "\u{a0}".repeat(4);
-        assert_eq!(
-            markdown,
-            format!("fn main() {{\n{four}run();\n{four}done();\n}}")
-        );
+        assert_eq!(markdown, "fn main() {\n    run();\n    done();\n}");
 
-        // A no-op edit keeps the indentation.
+        // A no-op edit keeps the indentation, as spaces.
         let html = to_html(&markdown);
-        let four = "&nbsp;".repeat(4);
-        assert_eq!(
-            html,
-            format!("<p>fn main() {{<br>{four}run();<br>{four}done();<br>}}</p>")
-        );
+        assert_eq!(html, "<p>fn main() {<br>    run();<br>    done();<br>}</p>");
         assert_eq!(editor_html_to_markdown(&html), markdown);
+    }
+
+    #[test]
+    fn indentation_is_spaces_where_markdown_keeps_them() {
+        // A paragraph's first line, or a line that would start a block, keeps no-break spaces.
+        let nbsp = "\u{a0}\u{a0}";
+        for (html, markdown) in [
+            (
+                "<p>  first<br>  second</p>",
+                format!("{nbsp}first\n  second"),
+            ),
+            ("<div>a</div><div>  - b</div>", format!("a\n{nbsp}- b")),
+            (
+                "<div>a</div><div><br></div><div>  b</div>",
+                format!("a\n\n{nbsp}b"),
+            ),
+            (
+                "<pre><code>a\n  b\n</code></pre>",
+                "```\na\n  b\n```".to_string(),
+            ),
+        ] {
+            assert_eq!(editor_html_to_markdown(html), markdown, "{html}");
+            // Stored as spaces, and read back the same.
+            let stored = to_html(&markdown);
+            assert!(!stored.contains("&nbsp;"), "{stored}");
+            assert_eq!(editor_html_to_markdown(&stored), markdown, "{stored}");
+        }
     }
 
     #[test]
