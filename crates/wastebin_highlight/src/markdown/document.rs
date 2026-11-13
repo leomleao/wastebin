@@ -14,7 +14,9 @@ use ammonia::{Builder, UrlRelative};
 use htmd::element_handler::{HandlerResult, Handlers};
 use htmd::options::BulletListMarker;
 use htmd::{Element, HtmlToMarkdown};
-use markup5ever_rcdom::{Node, NodeData};
+use html5ever::ParseOpts;
+use html5ever::tendril::TendrilSink;
+use markup5ever_rcdom::{Node, NodeData, RcDom};
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
 
 /// Convert the HTML of a document pad (`rich` extension) to the Markdown agents read and write.
@@ -25,6 +27,67 @@ use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
 pub fn editor_html_to_markdown(html: &str) -> String {
     let markdown = converter().convert(html).unwrap_or_default();
     unescape_intraword_underscores(&markdown)
+}
+
+/// The label the editor gives a document pad (`padLabel` in the editor): the first line of its
+/// text with any text, else the name of its first file.
+#[must_use]
+pub fn editor_html_label(html: &str) -> String {
+    let dom = html5ever::parse_document(RcDom::default(), ParseOpts::default()).one(html);
+    let mut text = String::new();
+    doc_text(&dom.document, &mut text);
+    if let Some(line) = text.lines().map(str::trim).find(|line| !line.is_empty()) {
+        return line.to_string();
+    }
+    find_element(&dom.document, "figcaption")
+        .and_then(|caption| match &caption.children.borrow().first()?.data {
+            NodeData::Text { contents } => Some(contents.borrow().split(" · ").next()?.to_string()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Text of the editor's HTML, one line per block, without files (`docText` in the editor).
+fn doc_text(node: &Rc<Node>, out: &mut String) {
+    const BLOCKS: [&str; 17] = [
+        "div",
+        "p",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+        "tr",
+        "pre",
+        "blockquote",
+        "figure",
+        "table",
+        "ul",
+        "ol",
+        "hr",
+    ];
+    for child in node.children.borrow().iter() {
+        match &child.data {
+            NodeData::Text { contents } => out.push_str(&contents.borrow()),
+            NodeData::Element { name, .. } => match &*name.local {
+                "figure" => {}
+                "br" => out.push('\n'),
+                tag => {
+                    let block = BLOCKS.contains(&tag);
+                    if block && !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                    doc_text(child, out);
+                    if block && !out.is_empty() && !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
 }
 
 /// Convert Markdown written by an agent to sanitized HTML the pad editor accepts as a document
@@ -964,6 +1027,30 @@ mod tests {
         let html = markdown_to_editor_html("![x](https://LOCALHOST:9/raw/def.png)", &uploads);
         assert!(html.starts_with("<figure"), "{html}");
         assert!(html.contains("<img src=\"/raw/def.png\""), "{html}");
+    }
+
+    #[test]
+    fn label_is_the_first_line_of_text() {
+        for (html, label) in [
+            (
+                "<h1>H<sub>2</sub>O &amp; <em>more</em></h1><p>next</p>",
+                "H2O & more",
+            ),
+            (
+                "<div><br></div><div>  second <a href=\"/x\">line</a></div>",
+                "second line",
+            ),
+            ("<p>a<br>b</p>", "a"),
+            (
+                "<figure class=\"inline-asset\" data-kind=\"image\"><img src=\"/raw/a.png\" alt=\"a.png\">\
+                 <figcaption>shot.png · 1 KB · <a href=\"/dl/a.png\">download</a></figcaption></figure><p>text</p>",
+                "text",
+            ),
+            (&figure_html("a.png", "shot.png", Some("1 KB")), "shot.png"),
+            ("", ""),
+        ] {
+            assert_eq!(editor_html_label(html), label, "{html}");
+        }
     }
 
     #[test]

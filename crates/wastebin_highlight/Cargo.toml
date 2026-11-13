@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 ammonia = "4"
 htmd = "0.5"
+html5ever = "0.38"
 markup5ever_rcdom = "0.38"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 syntect = { workspace = true }

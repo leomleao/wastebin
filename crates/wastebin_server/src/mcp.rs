@@ -31,7 +31,9 @@ use crate::pads::{PadError, PadResponse, PadWriteRequest, Pads, new_expiration, 
 use crate::{AppState, Page};
 use wastebin_core::db::{self, Database, read::Entry, write};
 use wastebin_core::id::Id;
-use wastebin_highlight::markdown::{Uploads, editor_html_to_markdown, markdown_to_editor_html};
+use wastebin_highlight::markdown::{
+    Uploads, editor_html_label, editor_html_to_markdown, markdown_to_editor_html,
+};
 
 /// Routes of the MCP server, merged into the app outside the timeout and compression layers.
 /// Disabled, `/mcp` is not found instead of being taken for a paste id.
@@ -262,13 +264,14 @@ impl Mcp {
         let expires = self.expiration(args.expires)?;
         // `rich` is what documents are stored as: never take it as editor HTML.
         let document = matches!(args.language.as_deref(), Some("document" | "rich"));
+        let content = if document {
+            markdown_to_editor_html(&args.text, &self.uploads(&parts, None).await?)
+        } else {
+            args.text
+        };
         let req = PadWriteRequest {
-            preview: Some(preview(&args.text)),
-            content: if document {
-                markdown_to_editor_html(&args.text, &self.uploads(&parts, None).await?)
-            } else {
-                args.text
-            },
+            preview: Some(preview(&content, document)),
+            content,
             extension: if document {
                 Some("rich".to_string())
             } else {
@@ -305,7 +308,7 @@ impl Mcp {
             extension => (args.text.clone(), extension),
         };
         let req = PadWriteRequest {
-            preview: Some(preview(&args.text)),
+            preview: Some(preview(&content, extension == "rich")),
             content,
             extension: Some(extension.to_string()),
             base_revision: Some(args.revision),
@@ -568,9 +571,17 @@ fn language(extension: &str) -> &str {
     }
 }
 
-/// Label of a pad in the pad list, as the editor makes it: the first non-blank line without a
-/// Markdown heading, list, task or quote marker.
-fn preview(text: &str) -> String {
+/// Label of a pad in the pad list, as the editor makes it from `content`, a document's HTML if
+/// `document`: the first non-blank line of its text without a Markdown heading, list, task or
+/// quote marker.
+fn preview(content: &str, document: bool) -> String {
+    let label;
+    let text = if document {
+        label = editor_html_label(content);
+        &label
+    } else {
+        content
+    };
     let line = text
         .lines()
         .map(str::trim)

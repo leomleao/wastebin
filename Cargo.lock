@@ -3088,6 +3088,7 @@ version = "3.9.0"
 dependencies = [
  "ammonia",
  "htmd",
+ "html5ever 0.38.0",
  "markup5ever_rcdom",
  "pulldown-cmark",
  "syntect",

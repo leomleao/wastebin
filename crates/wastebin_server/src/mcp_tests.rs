@@ -1170,6 +1170,34 @@ async fn documents_take_the_absolute_urls_of_uploads() -> TestResult {
 }
 
 #[tokio::test]
+async fn document_labels_are_their_text() -> TestResult {
+    let client = client().await;
+
+    let doc = create_pad(
+        &client,
+        json!({ "text": "## H<sub>2</sub>O is **wet** and `x`\n\nmore", "language": "document" }),
+    )
+    .await?;
+    let id = str_of(&doc, "id");
+    let label = async || -> Result<Value, Box<dyn std::error::Error>> {
+        let list = structured(&call(&client, "list_pads", json!({})).await?);
+        Ok(list["pads"][0]["preview"].clone())
+    };
+    assert_eq!(label().await?, "H2O is wet and x");
+
+    let pad = read_pad(&client, id).await?;
+    call(
+        &client,
+        "edit_pad",
+        json!({ "id": id, "text": "- [link](https://example.com) <u>here</u>", "revision": pad["revision"] }),
+    )
+    .await?;
+    assert_eq!(label().await?, "link here");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_pad_takes_rich_as_document() -> TestResult {
     let client = client().await;
 
