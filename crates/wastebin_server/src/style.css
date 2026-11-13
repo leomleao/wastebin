@@ -1255,6 +1255,36 @@ header {
   margin-left: 0;
 }
 
+.mcp-row {
+  display: flex;
+  align-items: center;
+  padding: 0 0 0 10px;
+}
+
+.mcp-row:has(:focus-visible) {
+  border-color: var(--accent);
+}
+
+.mcp-url {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--fg-dim);
+}
+
+.mcp-row .nav-button {
+  padding: 7px 8px;
+  border-radius: 0 2px 2px 0;
+  outline: none;
+}
+
+.mcp-row .nav-button svg {
+  width: 16px;
+  height: 16px;
+}
+
 .sidebar-collapsed > .panel {
   display: none;
 }
