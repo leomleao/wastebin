@@ -112,9 +112,11 @@ function writeClipboardText(text) {
   helper.value = text;
   helper.className = "clipboard-helper";
   document.body.appendChild(helper);
+  const focused = document.activeElement;
   helper.select();
   const ok = document.execCommand("copy");
   helper.remove();
+  focused?.focus({ preventScroll: true });
   return ok ? Promise.resolve() : Promise.reject(new Error("copy failed"));
 }
 
@@ -1384,6 +1386,13 @@ function markdown() {
 $("btn-copy").addEventListener("click", () =>
   copyText(state.mode === "doc" ? docText(docEditor) : textarea.value, t("Copied")));
 $("btn-copy-md").addEventListener("click", () => copyText(markdown(), t("CopiedMd")));
+
+// The MCP row only exists when the server has MCP enabled.
+const mcpUrl = $("mcp-url");
+if (mcpUrl) {
+  mcpUrl.textContent = mcpUrl.title = window.location.origin + "/mcp";
+  $("btn-copy-mcp").addEventListener("click", () => copyText(mcpUrl.textContent, t("CopiedUrl")));
+}
 
 // == Editing
 
