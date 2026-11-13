@@ -421,6 +421,10 @@ impl Mcp {
         Extension(parts): Extension<Parts>,
         Parameters(args): Parameters<CreatePasteArgs>,
     ) -> ToolResult {
+        let max = self.page.max_body_size;
+        if args.text.len() > max {
+            return Err(message(format!("text would exceed {max} bytes")));
+        }
         // As `POST /`, but without an owner: no client could ever claim it.
         let entry = write::Entry::from(insert::api::Entry {
             text: args.text,
@@ -534,6 +538,7 @@ fn failure(err: PadError) -> CallToolResult {
         PadError::Invalid(text) => message(text),
         PadError::UnsupportedMedia => message("only images and PDFs can be uploaded"),
         PadError::Busy => message("pad is busy, retry"),
+        PadError::TooLarge(max) => message(format!("pad would exceed {max} bytes")),
         PadError::Conflict(pad) => CallToolResult::structured_error(json!({
             "error": "the pad changed since your revision: merge into text and retry with revision",
             "revision": pad.revision,

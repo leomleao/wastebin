@@ -910,6 +910,51 @@ async fn upload_file_takes_what_the_asset_api_takes() -> TestResult {
 }
 
 #[tokio::test]
+async fn text_is_held_to_the_body_size_limit() -> TestResult {
+    const MAX: usize = 4096;
+    let client = Client::with_state(
+        state_with_limit(MAX),
+        StoreCookies(false),
+        Duration::from_secs(30),
+    )
+    .await;
+    let at_limit = "a".repeat(MAX);
+    let over = "a".repeat(MAX + 1);
+
+    let pad = create_pad(&client, json!({ "text": at_limit, "language": "txt" })).await?;
+    let id = str_of(&pad, "id");
+    call(&client, "create_paste", json!({ "text": at_limit })).await?;
+
+    let err = call_err(&client, "create_pad", json!({ "text": over })).await?;
+    assert!(err.contains("4096"), "{err}");
+    let err = call_err(
+        &client,
+        "edit_pad",
+        json!({ "id": id, "text": over, "revision": pad["revision"] }),
+    )
+    .await?;
+    assert!(err.contains("4096"), "{err}");
+    let err = call_err(&client, "create_paste", json!({ "text": over })).await?;
+    assert!(err.contains("4096"), "{err}");
+
+    // A document is held to the size of its HTML.
+    let markdown = "a".repeat(MAX - 2);
+    let err = call_err(
+        &client,
+        "create_pad",
+        json!({ "text": markdown, "language": "document" }),
+    )
+    .await?;
+    assert!(err.contains("4096"), "{err}");
+
+    assert_eq!(read_pad(&client, id).await?["text"], at_limit.as_str());
+    let list = structured(&call(&client, "list_pads", json!({})).await?);
+    assert_eq!(list["pads"].as_array().map(Vec::len), Some(1), "{list}");
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn document_pads_round_trip_markdown() -> TestResult {
     let client = client().await;
 

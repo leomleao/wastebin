@@ -55,6 +55,7 @@ impl IntoResponse for PadError {
             ),
             Self::Conflict(pad) => (StatusCode::CONFLICT, Json(pad)).into_response(),
             Self::Busy => json_error(StatusCode::SERVICE_UNAVAILABLE, "pad is busy, retry"),
+            Self::TooLarge(_) => json_error(StatusCode::PAYLOAD_TOO_LARGE, "pad too large"),
             Self::Other(err) => JsonErrorResponse::from(err).into_response(),
         }
     }

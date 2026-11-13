@@ -131,6 +131,9 @@ pub(crate) enum PadError {
     Conflict(Box<PadResponse>),
     /// The pad kept changing while a write retried: try again later.
     Busy,
+    /// The content would be larger than the configured maximum body size, carried here, which
+    /// the editor could then no longer save.
+    TooLarge(usize),
     /// Anything else. An unknown pad, or an entry that is not a pad, is
     /// `Error::Database(db::Error::NotFound)`.
     Other(Error),
@@ -210,6 +213,7 @@ impl Pads {
         {
             return Err(PadError::Invalid("create_key too long"));
         }
+        self.check_size(&req.content)?;
 
         // Finish even when the caller is dropped (timeout, disconnect), so that a pad that was
         // inserted always has its key recorded and a retry cannot duplicate it.
@@ -275,6 +279,7 @@ impl Pads {
     pub async fn update(&self, id: &str, req: PadWriteRequest) -> Result<PadResponse, PadError> {
         let id = parse_pad_id(id)?;
         let extension = pad_extension(&req)?;
+        self.check_size(&req.content)?;
         let has_base = req.base_revision.is_some();
 
         match self.write(id, pad_update(req, &extension)).await {
@@ -469,6 +474,15 @@ impl Pads {
             .into_iter()
             .map(|file| (file.path(), crate::media::format_size(file.size)))
             .collect())
+    }
+
+    /// Refuse `content` the editor could not save: larger than the maximum body size.
+    fn check_size(&self, content: &str) -> Result<(), PadError> {
+        let max = self.page.max_body_size;
+        if content.len() > max {
+            return Err(PadError::TooLarge(max));
+        }
+        Ok(())
     }
 
     /// Receiver of `{type, id, revision}` JSON for every pad change.
