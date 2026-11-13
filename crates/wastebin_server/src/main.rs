@@ -223,11 +223,7 @@ fn make_app(state: AppState, timeout: Duration, max_body_size: usize) -> Router 
         .with_state(state.clone());
 
     // Long-lived like the event stream, so outside the timeout and compression layers too.
-    let mcp_router = if state.page.mcp {
-        mcp::router(state.clone())
-    } else {
-        Router::new()
-    };
+    let mcp_router = mcp::router(state.clone());
 
     app.route("/", get(html::index::get).post(insert::api::post))
         .route("/robots.txt", get(robots::get))

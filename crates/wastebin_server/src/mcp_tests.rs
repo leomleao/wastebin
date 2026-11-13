@@ -957,31 +957,6 @@ async fn create_pad_takes_rich_as_document() -> TestResult {
 }
 
 #[tokio::test]
-async fn mcp_can_be_disabled() -> TestResult {
-    let state = state_with("0", false);
-    let client = Client::with_state(state, StoreCookies(false), Duration::from_secs(30)).await;
-
-    let res = post_rpc(&client, "tools/list", &json!({})).await?;
-    let status = res.status();
-    let body = res.text().await?;
-    assert!(status.is_client_error(), "{status}");
-    assert!(!body.contains("jsonrpc"), "{body}");
-    let res = client.get("/mcp").send().await?;
-    assert!(res.status().is_client_error(), "{}", res.status());
-
-    // The settings cog doesn't offer it.
-    let html = client.get("/").send().await?.text().await?;
-    assert!(!html.contains("mcp-url"), "cog shows mcp");
-
-    // Enabled, it does.
-    let enabled = self::client().await;
-    let html = enabled.get("/").send().await?.text().await?;
-    assert!(html.contains("mcp-url"), "cog lacks mcp");
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn mcp_writes_emit_pad_update_events() -> TestResult {
     let client = client().await;
 
@@ -1026,10 +1001,8 @@ async fn mcp_writes_emit_pad_update_events() -> TestResult {
     Ok(())
 }
 
-/// Spec: `WASTEBIN_MCP=false` makes `/mcp` a 404. The paste route `/{id}` catches it instead and
-/// answers 400 (`mcp` is not a valid id).
+/// `WASTEBIN_MCP=false` makes `/mcp` a 404, not a paste id, and hides it from the settings cog.
 #[tokio::test]
-#[ignore = "product bug: with WASTEBIN_MCP=false, /mcp answers 400 from the paste route, not 404"]
 async fn disabled_mcp_is_not_found() -> TestResult {
     let state = state_with("0", false);
     let client = Client::with_state(state, StoreCookies(false), Duration::from_secs(30)).await;
@@ -1038,6 +1011,11 @@ async fn disabled_mcp_is_not_found() -> TestResult {
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
     let res = client.get("/mcp").send().await?;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    let html = client.get("/").send().await?.text().await?;
+    assert!(!html.contains("mcp-url"), "cog shows mcp");
+    let html = self::client().await.get("/").send().await?.text().await?;
+    assert!(html.contains("mcp-url"), "cog lacks mcp");
 
     Ok(())
 }

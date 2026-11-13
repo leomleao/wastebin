@@ -6,6 +6,8 @@
 use std::sync::Arc;
 
 use axum::Router;
+use axum::http::StatusCode;
+use axum::routing::any;
 use axum::extract::FromRef;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -29,9 +31,13 @@ use wastebin_core::db::{self, Database, read::Entry, write};
 use wastebin_core::id::Id;
 use wastebin_highlight::markdown::{editor_html_to_markdown, markdown_to_editor_html};
 
-/// Routes of the MCP server. Merged into the app outside the timeout and compression layers,
-/// and only when MCP is enabled.
+/// Routes of the MCP server, merged into the app outside the timeout and compression layers.
+/// Disabled, `/mcp` is not found instead of being taken for a paste id.
 pub(crate) fn router(state: AppState) -> Router {
+    if !state.page.mcp {
+        return Router::new().route("/mcp", any(|| async { StatusCode::NOT_FOUND }));
+    }
+
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true)
