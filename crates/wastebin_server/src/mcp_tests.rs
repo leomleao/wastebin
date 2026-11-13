@@ -1150,6 +1150,22 @@ async fn documents_take_the_absolute_urls_of_uploads() -> TestResult {
         format!("![x]({path})")
     );
 
+    // Appended to the pad that owns it, the file makes a figure at any host the agent uses.
+    let id = str_of(&notes, "id");
+    for url in [
+        url.replace("wastebin.lan", "WASTEBIN.LAN"),
+        url.replace("wastebin.lan", "127.0.0.1:18097"),
+    ] {
+        call(
+            &client,
+            "append_to_pad",
+            json!({ "id": id, "text": format!("![y]({url})") }),
+        )
+        .await?;
+    }
+    let text = str_of(&read_pad(&client, id).await?, "text").to_string();
+    assert_eq!(text.matches(&format!("![y]({path})")).count(), 2, "{text}");
+
     Ok(())
 }
 

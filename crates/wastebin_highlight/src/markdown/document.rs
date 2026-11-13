@@ -141,7 +141,7 @@ fn indented_lines<'a>(markdown: &'a str, events: Vec<(Event<'a>, Range<usize>)>)
 fn editor_events<'a>(events: Vec<Event<'a>>, uploads: &Uploads) -> Vec<Event<'a>> {
     let events: Vec<Event<'a>> = events
         .into_iter()
-        .map(|event| relative_link(event, uploads.origin.as_deref()))
+        .map(|event| relative_link(event, uploads))
         .collect();
     let sizes = &uploads.sizes;
     let mut out = Vec::with_capacity(events.len());
@@ -206,14 +206,12 @@ fn editor_events<'a>(events: Vec<Event<'a>>, uploads: &Uploads) -> Vec<Event<'a>
     out
 }
 
-/// `event` with the URL of a link or image into `origin` made relative.
-fn relative_link<'a>(event: Event<'a>, origin: Option<&str>) -> Event<'a> {
+/// `event` with the URL of a link or image into this server made relative.
+fn relative_link<'a>(event: Event<'a>, uploads: &Uploads) -> Event<'a> {
     let relative = |url: CowStr<'a>| -> CowStr<'a> {
-        match origin.and_then(|origin| url.strip_prefix(origin)) {
-            Some(path) if path.starts_with('/') && !path.starts_with("//") => {
-                path.to_string().into()
-            }
-            _ => url,
+        match local_path(&url, uploads) {
+            Some(path) => path.to_string().into(),
+            None => url,
         }
     };
     match event {
@@ -241,6 +239,46 @@ fn relative_link<'a>(event: Event<'a>, origin: Option<&str>) -> Event<'a> {
         }),
         event => event,
     }
+}
+
+/// The path of `url` if it points into this server: an http(s) URL with the server's origin, or
+/// of one of the known uploads, whatever its host.
+fn local_path<'u>(url: &'u str, uploads: &Uploads) -> Option<&'u str> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !["http", "https"]
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(scheme))
+    {
+        return None;
+    }
+    let path = &rest[rest.find(['/', '?', '#']).unwrap_or(rest.len())..];
+    if !path.starts_with('/') || path.starts_with("//") {
+        return None;
+    }
+
+    let origin = &url[..url.len() - path.len()];
+    let same_origin = uploads
+        .origin
+        .as_deref()
+        .is_some_and(|ours| normalized_origin(ours) == normalized_origin(origin));
+    let id = |path: &str| path.split('.').next().unwrap_or_default().to_string();
+    let known_upload = path
+        .strip_prefix("/raw/")
+        .is_some_and(|file| uploads.sizes.keys().any(|known| id(known) == id(file)));
+    (same_origin || known_upload).then_some(path)
+}
+
+/// `origin` (`scheme://host[:port]`) in lower case, without the scheme's default port.
+fn normalized_origin(origin: &str) -> String {
+    let origin = origin.trim_end_matches('/').to_ascii_lowercase();
+    for (scheme, port) in [("http://", ":80"), ("https://", ":443")] {
+        if origin.starts_with(scheme)
+            && let Some(origin) = origin.strip_suffix(port)
+        {
+            return origin.to_string();
+        }
+    }
+    origin
 }
 
 /// If `events` starts with a paragraph holding only uploaded images and PDF links, return their
@@ -903,6 +941,29 @@ mod tests {
              <p><a href=\"/pad/abc\">pad</a> <a href=\"http://bin.lan.evil/raw/abc.png\">other</a> \
              <a href=\"http://bin.lan//evil.com/x\">same</a> <code>http://bin.lan/x</code></p>"
         );
+    }
+
+    #[test]
+    fn links_into_this_server_match_loosely() {
+        let uploads = Uploads {
+            origin: Some("http://bin.lan".to_string()),
+            sizes: HashMap::from([("def.png".to_string(), "1 KB".to_string())]),
+        };
+        let html = markdown_to_editor_html(
+            "[a](HTTP://Bin.LAN/pad/a) [b](http://bin.lan:80/pad/b) \
+             [c](http://10.0.0.2:8088/raw/def.png) [d](https://example.com/raw/zzz.png) \
+             [e](http://bin.lan:8080/pad/e)",
+            &uploads,
+        );
+        assert_eq!(
+            html,
+            "<p><a href=\"/pad/a\">a</a> <a href=\"/pad/b\">b</a> <a href=\"/raw/def.png\">c</a> \
+             <a href=\"https://example.com/raw/zzz.png\">d</a> <a href=\"http://bin.lan:8080/pad/e\">e</a></p>"
+        );
+        // A known upload at another host is a figure.
+        let html = markdown_to_editor_html("![x](https://LOCALHOST:9/raw/def.png)", &uploads);
+        assert!(html.starts_with("<figure"), "{html}");
+        assert!(html.contains("<img src=\"/raw/def.png\""), "{html}");
     }
 
     #[test]
