@@ -71,8 +71,7 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
         }
         if !ext_trimmed.is_empty() && !ext_trimmed.eq_ignore_ascii_case("auto") {
             let normalized = ext_trimmed.to_ascii_lowercase();
-            let (name, default_is_code) = lang_name_for_ext(&normalized);
-            let is_code = default_is_code && !has_rich_inline_html(content);
+            let (name, is_code) = lang_name_for_ext(&normalized);
             return DetectedLang {
                 extension: normalized,
                 name: name.to_string(),
@@ -81,14 +80,7 @@ pub fn detect_language(content: &str, explicit_ext: Option<&str>) -> DetectedLan
         }
     }
 
-    if has_rich_inline_html(content) {
-        return DetectedLang {
-            extension: "rich".to_string(),
-            name: "Document".to_string(),
-            is_code: false,
-        };
-    }
-
+    // Document mode is only ever chosen explicitly: HTML typed into the code editor is source.
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return DetectedLang {
@@ -485,11 +477,19 @@ mod tests {
     }
 
     #[test]
-    fn detects_rich_html() {
+    fn documents_are_only_explicit() {
         let doc = "<p>Here is an inline screenshot:</p><figure class=\"inline-asset\"><img src=\"/raw/abc.png\"></figure>";
-        let detected = detect_language(doc, None);
+        assert_ne!(detect_language(doc, None).extension, "rich");
+        assert_ne!(detect_language(doc, Some("auto")).extension, "rich");
+
+        let detected = detect_language(doc, Some("rich"));
         assert_eq!(detected.extension, "rich");
         assert_eq!(detected.name, "Document");
         assert!(!detected.is_code);
+
+        assert!(is_document(Some("rich"), "plain"));
+        assert!(is_document(Some("html"), doc));
+        assert!(!is_document(Some("html"), "<!DOCTYPE html><html></html>"));
+        assert!(!is_document(Some("rs"), doc));
     }
 }
