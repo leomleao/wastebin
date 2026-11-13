@@ -19,22 +19,19 @@ pub use document::{
 /// [`ammonia`], so tags like `<details>` or `<kbd>` survive while `<script>`, inline event
 /// handlers, `javascript:` URLs and other XSS vectors are stripped.
 pub fn render(text: &str, highlighter: &Highlighter) -> Result<Html, Error> {
-    let parser = Parser::new_ext(text, options());
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_GFM;
+
+    let parser = Parser::new_ext(text, options);
     let events = rewrite_events(parser, highlighter)?;
 
     let mut raw = String::with_capacity(text.len());
     html::push_html(&mut raw, events.into_iter());
 
     Ok(Html::new(sanitizer().clean(&raw).to_string()))
-}
-
-/// Markdown extensions enabled for rendering.
-fn options() -> Options {
-    Options::ENABLE_TABLES
-        | Options::ENABLE_STRIKETHROUGH
-        | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_FOOTNOTES
-        | Options::ENABLE_GFM
 }
 
 /// Sanitize the HTML of a document-mode pad for display, with the same allowlist as rendered

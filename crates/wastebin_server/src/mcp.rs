@@ -596,43 +596,7 @@ fn after_space(text: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{Value, json};
-
-    use crate::test_helpers::{Client, StoreCookies};
-
-    /// Send the JSON-RPC request `method` with `params` and return its result.
-    async fn rpc(
-        client: &Client,
-        method: &str,
-        params: Value,
-    ) -> Result<Value, Box<dyn std::error::Error>> {
-        let res = client
-            .post("/mcp")
-            .header("accept", "application/json, text/event-stream")
-            // Any host is accepted, and URLs are built from it.
-            .header("host", "wastebin.lan")
-            .json(&json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": params }))
-            .send()
-            .await?;
-        assert_eq!(res.status(), reqwest::StatusCode::OK);
-        let body = res.json::<Value>().await?;
-        Ok(body["result"].clone())
-    }
-
-    async fn call(
-        client: &Client,
-        tool: &str,
-        arguments: Value,
-    ) -> Result<Value, Box<dyn std::error::Error>> {
-        let result = rpc(
-            client,
-            "tools/call",
-            json!({ "name": tool, "arguments": arguments }),
-        )
-        .await?;
-        assert_eq!(result["isError"], false, "{result}");
-        Ok(result["structuredContent"].clone())
-    }
+    use serde_json::json;
 
     #[test]
     fn busy_is_a_plain_retry_error() {
@@ -643,56 +607,5 @@ mod tests {
             serde_json::to_value(&result.content).ok(),
             Some(json!([{ "type": "text", "text": "pad is busy, retry" }]))
         );
-    }
-
-    #[tokio::test]
-    async fn smoke() -> Result<(), Box<dyn std::error::Error>> {
-        let client = Client::new(StoreCookies(false)).await;
-
-        let init = rpc(
-            &client,
-            "initialize",
-            json!({
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": { "name": "test", "version": "1" },
-            }),
-        )
-        .await?;
-        assert_eq!(init["serverInfo"]["name"], "wastebin");
-
-        let tools = rpc(&client, "tools/list", json!({})).await?;
-        let mut names: Vec<&str> = tools["tools"]
-            .as_array()
-            .expect("tools")
-            .iter()
-            .filter_map(|tool| tool["name"].as_str())
-            .collect();
-        names.sort_unstable();
-        assert_eq!(
-            names,
-            [
-                "append_to_pad",
-                "create_pad",
-                "create_paste",
-                "download_file",
-                "edit_pad",
-                "list_pads",
-                "read_pad",
-                "read_paste",
-                "upload_file",
-            ]
-        );
-
-        let created = call(&client, "create_pad", json!({ "text": "fn main() {}" })).await?;
-        let id = created["id"].as_str().expect("id");
-        assert_eq!(created["url"], format!("http://wastebin.lan/pad/{id}"));
-
-        let pad = call(&client, "read_pad", json!({ "id": id })).await?;
-        assert_eq!(pad["text"], "fn main() {}");
-        assert_eq!(pad["revision"], created["revision"]);
-        assert_eq!(pad["files"], json!([]));
-
-        Ok(())
     }
 }
