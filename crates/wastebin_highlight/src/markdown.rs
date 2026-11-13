@@ -13,19 +13,42 @@ use crate::{Highlighter, Html};
 /// [`ammonia`], so tags like `<details>` or `<kbd>` survive while `<script>`, inline event
 /// handlers, `javascript:` URLs and other XSS vectors are stripped.
 pub fn render(text: &str, highlighter: &Highlighter) -> Result<Html, Error> {
-    let options = Options::ENABLE_TABLES
-        | Options::ENABLE_STRIKETHROUGH
-        | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_FOOTNOTES
-        | Options::ENABLE_GFM;
-
-    let parser = Parser::new_ext(text, options);
+    let parser = Parser::new_ext(text, options());
     let events = rewrite_events(parser, highlighter)?;
 
     let mut raw = String::with_capacity(text.len());
     html::push_html(&mut raw, events.into_iter());
 
     Ok(Html::new(sanitizer().clean(&raw).to_string()))
+}
+
+/// Convert the HTML of a document pad (`rich` extension) to the Markdown agents read and write.
+///
+/// Together with [`markdown_to_editor_html`] this is the seam between document pads and Markdown:
+/// the MCP server converts with these two functions only.
+#[must_use]
+pub fn editor_html_to_markdown(html: &str) -> String {
+    // Stub: unchanged until the conversion is implemented.
+    html.to_string()
+}
+
+/// Convert Markdown written by an agent to sanitized HTML the pad editor accepts as a document
+/// pad (`rich` extension). The inverse of [`editor_html_to_markdown`].
+#[must_use]
+pub fn markdown_to_editor_html(markdown: &str) -> String {
+    // Stub: plain rendering, without the editor's figure markup.
+    let mut raw = String::with_capacity(markdown.len());
+    html::push_html(&mut raw, Parser::new_ext(markdown, options()));
+    sanitizer().clean(&raw).to_string()
+}
+
+/// Markdown extensions enabled for rendering and conversion.
+fn options() -> Options {
+    Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_GFM
 }
 
 /// Sanitize the HTML of a document-mode pad for display, with the same allowlist as rendered
