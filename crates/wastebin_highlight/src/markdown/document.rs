@@ -378,7 +378,8 @@ fn asset_markdown(element: &Element) -> Option<String> {
 }
 
 /// A `<div>` is one line of the editor; an empty one is a blank line. Only the line's leading
-/// newline is emitted: htmd adds up the newlines between siblings.
+/// newline is emitted: htmd adds up the newlines between siblings. Leading spaces become no-break
+/// spaces, which Markdown keeps, so that an indented line stays indented.
 fn line_handler(handlers: &dyn Handlers, element: Element) -> Option<HandlerResult> {
     let content = handlers.walk_children(element.node).content;
     let content = content.trim_matches('\n');
@@ -392,8 +393,26 @@ fn line_handler(handlers: &dyn Handlers, element: Element) -> Option<HandlerResu
     } else if has_blocks {
         format!("\n\n{content}\n\n").into()
     } else {
-        format!("\n{content}").into()
+        let content = content.trim_start_matches(' ');
+        format!("\n{}{content}", indentation(element.node)).into()
     })
+}
+
+/// The leading spaces of `node`'s text as no-break spaces, a tab as four.
+fn indentation(node: &Rc<Node>) -> String {
+    let children = node.children.borrow();
+    let Some(NodeData::Text { contents }) = children.first().map(|child| &child.data) else {
+        return String::new();
+    };
+    contents
+        .borrow()
+        .chars()
+        .map_while(|c| match c {
+            ' ' => Some("\u{a0}"),
+            '\t' => Some("\u{a0}\u{a0}\u{a0}\u{a0}"),
+            _ => None,
+        })
+        .collect()
 }
 
 fn strikethrough_handler(handlers: &dyn Handlers, element: Element) -> Option<HandlerResult> {
@@ -585,6 +604,24 @@ mod tests {
             editor_html_to_markdown(html),
             "first\nsecond\n\nthird\nfourth"
         );
+    }
+
+    #[test]
+    fn indented_editor_lines_stay_indented() {
+        // A code pad turned document by an upload: one line per `<div>`.
+        let html = "<div>fn main() {</div><div>    run();</div><div>\tdone();</div><div>}</div>";
+        let markdown = editor_html_to_markdown(html);
+        let four = "\u{a0}".repeat(4);
+        assert_eq!(markdown, format!("fn main() {{\n{four}run();\n{four}done();\n}}"));
+
+        // A no-op edit keeps the indentation.
+        let html = markdown_to_editor_html(&markdown);
+        let four = "&nbsp;".repeat(4);
+        assert_eq!(
+            html,
+            format!("<p>fn main() {{<br>{four}run();<br>{four}done();<br>}}</p>")
+        );
+        assert_eq!(editor_html_to_markdown(&html), markdown);
     }
 
     #[test]
