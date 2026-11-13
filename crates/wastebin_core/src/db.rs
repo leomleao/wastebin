@@ -11,7 +11,7 @@ use tokio::sync::oneshot;
 use crate::crypto::{self, Password};
 use crate::expiration::Expiration;
 use crate::id::Id;
-use read::{DatabaseEntry, ListEntry, Metadata, PadSummary};
+use read::{DatabaseEntry, ListEntry, Metadata, PadAsset, PadSummary};
 
 /// Database related errors.
 #[derive(thiserror::Error, Debug)]
@@ -115,6 +115,10 @@ enum Command {
     ListRecentPads {
         limit: usize,
         result: oneshot::Sender<Result<Vec<PadSummary>, Error>>,
+    },
+    ListPadAssets {
+        id: Id,
+        result: oneshot::Sender<Result<Vec<PadAsset>, Error>>,
     },
 }
 
@@ -368,6 +372,17 @@ pub mod read {
         pub updated_at: Option<String>,
     }
 
+    /// An image or PDF uploaded into a pad.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct PadAsset {
+        /// Identifier
+        pub id: Id,
+        /// File name given on upload
+        pub title: Option<String>,
+        /// File extension
+        pub extension: Option<String>,
+    }
+
     impl DatabaseEntry {
         pub async fn decrypt(
             self,
@@ -508,6 +523,9 @@ impl Handler {
                     .map_err(|_| Error::ResultSendError),
                 Command::ListRecentPads { limit, result } => result
                     .send(self.list_recent_pads(limit))
+                    .map_err(|_| Error::ResultSendError),
+                Command::ListPadAssets { id, result } => result
+                    .send(self.list_pad_assets(id))
                     .map_err(|_| Error::ResultSendError),
             };
 
@@ -835,6 +853,24 @@ impl Handler {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(pads)
+    }
+
+    fn list_pad_assets(&self, id: Id) -> Result<Vec<PadAsset>, Error> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, title, extension FROM entries WHERE is_asset = 1 AND owner = ?1 AND {LIVE} ORDER BY updated_at"
+        ))?;
+
+        let assets = stmt
+            .query_map(params![id.to_i64()], |row| {
+                Ok(PadAsset {
+                    id: Id::from(row.get::<_, i64>(0)?),
+                    title: row.get(1)?,
+                    extension: row.get(2)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(assets)
     }
 }
 
@@ -1231,6 +1267,16 @@ impl Database {
         let (result, command_result) = oneshot::channel();
         self.sender
             .send(Command::ListRecentPads { limit, result })
+            .await
+            .map_err(|_| Error::SendError)?;
+        command_result.await?
+    }
+
+    /// List the images and PDFs uploaded into pad `id`, oldest first.
+    pub async fn list_pad_assets(&self, id: Id) -> Result<Vec<read::PadAsset>, Error> {
+        let (result, command_result) = oneshot::channel();
+        self.sender
+            .send(Command::ListPadAssets { id, result })
             .await
             .map_err(|_| Error::SendError)?;
         command_result.await?
@@ -1727,6 +1773,44 @@ mod tests {
             db.get(paste, None).await?.unwrap_inner().text,
             "not an asset"
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pad_assets_are_listed_by_owner() -> Result<(), Box<dyn std::error::Error>> {
+        let db = new_db()?;
+
+        let (pad_a, _) = db.insert(pad("a")).await?;
+        let (pad_b, _) = db.insert(pad("b")).await?;
+        let first = db
+            .insert_asset(b"png", "png", Some("a.png".to_string()), None, Some(pad_a))
+            .await?;
+        let second = db
+            .insert_asset(b"%PDF", "pdf", None, None, Some(pad_a))
+            .await?;
+        db.insert_asset(b"png", "png", None, None, None).await?;
+
+        let listed = db.list_pad_assets(pad_a).await?;
+        assert_eq!(
+            listed,
+            vec![
+                read::PadAsset {
+                    id: first,
+                    title: Some("a.png".to_string()),
+                    extension: Some("png".to_string()),
+                },
+                read::PadAsset {
+                    id: second,
+                    title: None,
+                    extension: Some("pdf".to_string()),
+                },
+            ]
+        );
+        assert!(db.list_pad_assets(pad_b).await?.is_empty());
+
+        assert!(db.delete_pad(pad_a).await?);
+        assert!(db.list_pad_assets(pad_a).await?.is_empty());
 
         Ok(())
     }
